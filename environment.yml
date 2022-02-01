@@ -14,3 +14,4 @@ dependencies:
     - rioxarray==0.7.0
     - scikit-learn==0.24.2
     - torch==1.9.0
+    - openpyxl==3.0.9
