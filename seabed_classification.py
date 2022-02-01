@@ -18,6 +18,7 @@ from libs.mlp import *
 import pandas as pd
 
 from utils.reporting import _get_cm
+from utils.dataset import split_by_polygon_id
 
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import LinearSVC
@@ -40,6 +41,9 @@ def parse_arguments():
     )
     parser.add_argument(
         "--gt", type=str, help="Path of reference data image", default="GT.tif"
+    )
+    parser.add_argument(
+        "--polygons", type=str, help="Path of polygon IDs raster", default=""
     )
     parser.add_argument(
         "--bathy", type=str, help="Bathymetry layer", default="bathymetry.tif"
@@ -124,6 +128,20 @@ def main():
     mask_cum = np.logical_and(mask_cum, mask_input)
     print("done!")
 
+    if args.polygons:
+        print("Reading polygon IDs...", end=" ")
+        poly_raster = rioxarray.open_rasterio(
+            get_file_loc(args.dataset_dir, args.polygons)
+        )
+        if poly_raster.data.dtype != np.uint8:
+            poly_raster.data = poly_raster.data.astype(np.uint8)
+        mask_poly = np.all(poly_raster.data != poly_raster.rio.nodata, axis=0)
+        num_polys = np.unique(poly_raster.data).size - 1
+        assert np.all(
+            mask_gt == mask_poly
+        ), "GT mask does not correspond to polygon IDs mask"
+        print("done!")
+
     if args.bathy:
         print("Reading bathy...", end=" ")
         bathy_raster = rioxarray.open_rasterio(
@@ -148,6 +166,8 @@ def main():
     pos_y, pos_x = np.where(mask_cum)
     gt_filt = gt_raster.data[0, mask_cum] - 1
     data_pixels = input_raster.data.reshape((3, -1))[:, mask_cum.flatten()].transpose()
+    if args.polygons:
+        poly_filt = poly_raster.data[0, mask_cum]
     if args.bathy:
         data_pixels = np.append(
             data_pixels,
@@ -175,7 +195,10 @@ def main():
     else:
         in_data = data_pixels_n
 
-    tdata = TensorDataset(torch.tensor(in_data), torch.tensor(gt_filt))
+    dataset_tensors = [torch.tensor(in_data), torch.tensor(gt_filt)]
+    if args.polygons:
+        dataset_tensors += [torch.tensor(poly_filt)]
+    tdata = TensorDataset(*dataset_tensors)
     len_data = len(tdata)
     print("Number of samples: %d" % len_data)
 
@@ -197,14 +220,24 @@ def main():
                 param_dict.update({"Epochs": args.epochs, "Batch": args.batch})
             mlflow.log_params(param_dict)
             mlflow.set_tag("Model", args.model)
-            mlflow.set_tag("PE", args.embedding_dim>0)
+            mlflow.set_tag("PE", args.embedding_dim > 0)
         acc_res = []
         for cnt, run in enumerate(range(args.runs)):
             print("Run %d/%d" % (run + 1, args.runs))
-            train_set, val_set = torch.utils.data.random_split(
-                tdata, (train_size, val_size)  # , torch.Generator().manual_seed(42)
-            )
-            # val_set = tdata
+            if args.polygons:
+                train_set, val_set, train_sum, val_sum = split_by_polygon_id(
+                    tdata, args.perc, return_sums=True
+                )
+                split_ratios = train_sum / (train_sum + val_sum)
+                print(
+                    "Training split ratio per class: [%s]"
+                    % (" ".join(["{0:0.2f}".format(val) for val in split_ratios]))
+                )
+            else:
+                train_set, val_set = torch.utils.data.random_split(
+                    tdata, (train_size, val_size)  # , torch.Generator().manual_seed(42)
+                )
+                # val_set = tdata
 
             all_data = input_raster.data.reshape((3, -1))
             all_data = all_data[:, mask_valid.flatten()].transpose()
@@ -291,7 +324,7 @@ def main():
         print(cm)
         if args.track:
             mlflow.log_metric("Kappa", float(cm.PA[-2]))
-        
+
         if args.xls_file:
             xls_path = args.output_dir + "/" + args.xls_file + ".xlsx"
             writer = pd.ExcelWriter(xls_path)
