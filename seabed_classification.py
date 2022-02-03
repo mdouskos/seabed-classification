@@ -1,7 +1,9 @@
 import os
 import argparse
+from turtle import position
 
 import numpy as np
+import scipy
 
 from contextlib import nullcontext
 
@@ -18,14 +20,14 @@ from libs.mlp import *
 import pandas as pd
 
 from utils.reporting import _get_cm
-from utils.dataset import split_by_polygon_id
+from utils.dataset import *
 
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import LinearSVC
 
 from time import monotonic
 
-
+# np.random.seed(1234)
 # matplotlib.use('TkAgg')
 
 
@@ -45,9 +47,7 @@ def parse_arguments():
     parser.add_argument(
         "--polygons", type=str, help="Path of polygon IDs raster", default=""
     )
-    parser.add_argument(
-        "--bathy", type=str, help="Bathymetry layer", default="bathymetry.tif"
-    )
+    parser.add_argument("--bathy", type=str, help="Bathymetry layer", default="")
     parser.add_argument("--runs", type=int, help="Number of runs", default=1)
     parser.add_argument(
         "--perc",
@@ -108,6 +108,7 @@ def get_file_loc(dirn, filen):
 
 
 def main():
+
     args = parse_arguments()
 
     print("Reading ground truth...", end=" ")
@@ -126,6 +127,7 @@ def main():
     mask_input = np.all(input_raster.data != input_raster.rio.nodata, axis=0)
     mask_valid = mask_input
     mask_cum = np.logical_and(mask_cum, mask_input)
+    raster_shape = input_raster.data.shape[1:]
     print("done!")
 
     if args.polygons:
@@ -136,7 +138,6 @@ def main():
         if poly_raster.data.dtype != np.uint8:
             poly_raster.data = poly_raster.data.astype(np.uint8)
         mask_poly = np.all(poly_raster.data != poly_raster.rio.nodata, axis=0)
-        num_polys = np.unique(poly_raster.data).size - 1
         assert np.all(
             mask_gt == mask_poly
         ), "GT mask does not correspond to polygon IDs mask"
@@ -147,6 +148,10 @@ def main():
         bathy_raster = rioxarray.open_rasterio(
             get_file_loc(args.dataset_dir, args.bathy)
         )
+        # BPI = (
+        #     bathy_raster.data
+        #     - scipy.ndimage.uniform_filter(bathy_raster.data, 17, mode="constant")
+        # ).astype(np.int)
         mask_bathy = np.all(bathy_raster.data != bathy_raster.rio.nodata, axis=0)
         mask_cum = np.logical_and(mask_cum, mask_bathy)
         mask_valid = np.logical_and(mask_valid, mask_bathy)
@@ -163,7 +168,7 @@ def main():
         plt.imshow(gt_show, cmap="Set1")
         plt.show()
 
-    pos_y, pos_x = np.where(mask_cum)
+    pos_data = np.where(mask_cum)
     gt_filt = gt_raster.data[0, mask_cum] - 1
     data_pixels = input_raster.data.reshape((3, -1))[:, mask_cum.flatten()].transpose()
     if args.polygons:
@@ -172,6 +177,7 @@ def main():
         data_pixels = np.append(
             data_pixels,
             bathy_raster.data.flatten()[mask_cum.flatten(), np.newaxis],
+            # BPI.flatten()[mask_cum.flatten(), np.newaxis],
             axis=1,
         )
     if args.normalize:
@@ -186,12 +192,7 @@ def main():
 
     if d_emb > 0:
         print("Using positional embedding with dim %d and sigma %.3f" % (d_emb, sigma))
-        div_term = np.random.randn(2, d_emb // 2) * sigma ** 2
-        p_emb_kern = np.einsum("ij,ik->jk", [pos_x, pos_y], div_term)
-
-        in_data = np.concatenate(
-            [np.sin(p_emb_kern), np.cos(p_emb_kern), data_pixels_n], 1
-        )
+        in_data, div_term = positional_encoding(data_pixels_n, pos_data, d_emb, sigma)
     else:
         in_data = data_pixels_n
 
@@ -222,6 +223,8 @@ def main():
             mlflow.set_tag("Model", args.model)
             mlflow.set_tag("PE", args.embedding_dim > 0)
         acc_res = []
+        best_result = None
+        pred_all = None
         for cnt, run in enumerate(range(args.runs)):
             print("Run %d/%d" % (run + 1, args.runs))
             if args.polygons:
@@ -235,26 +238,37 @@ def main():
                 )
             else:
                 train_set, val_set = torch.utils.data.random_split(
-                    tdata, (train_size, val_size)  # , torch.Generator().manual_seed(42)
+                    tdata, (train_size, val_size), torch.Generator().manual_seed(42)
                 )
                 # val_set = tdata
 
-            all_data = input_raster.data.reshape((3, -1))
-            all_data = all_data[:, mask_valid.flatten()].transpose()
-            if args.bathy:
-                all_data = np.append(
-                    all_data,
-                    bathy_raster.data.flatten()[mask_valid.flatten(), np.newaxis],
-                    axis=1,
-                )
-            if args.normalize:
-                all_data_n = (all_data - np.mean(data_pixels, axis=0)) / np.std(
-                    data_pixels, axis=0
-                )
-            else:
-                all_data_n = all_data
+            if args.class_map:
 
-            all_dataset = TensorDataset(torch.tensor(all_data_n))
+                all_data = input_raster.data.reshape((3, -1))
+                all_data = all_data[:, mask_valid.flatten()].transpose()
+                if args.bathy:
+                    all_data = np.append(
+                        all_data,
+                        bathy_raster.data.flatten()[mask_valid.flatten(), np.newaxis],
+                        axis=1,
+                    )
+                if args.normalize:
+                    all_data_n = (all_data - np.mean(data_pixels, axis=0)) / np.std(
+                        data_pixels, axis=0
+                    )
+                else:
+                    all_data_n = all_data
+
+                if d_emb > 0:
+                    # pos_x, pos_y = np.meshgrid(
+                    #     np.arange(raster_shape[1]), np.arange(raster_shape[0])
+                    # )
+                    pos_all = np.where(mask_valid)
+                    all_data_n, _ = positional_encoding(
+                        all_data_n, pos_all, d_emb, sigma, div_term=div_term
+                    )
+
+                all_dataset = TensorDataset(torch.tensor(all_data_n))
 
             if args.model == "nn":
                 D_in = data_pixels_n.shape[1] + d_emb
@@ -283,7 +297,11 @@ def main():
 
             elif args.model == "rf":
                 print("Training RF model")
-                model = RandomForestClassifier(n_estimators=2)  # , max_depth = "auto")
+                model = RandomForestClassifier(
+                    n_estimators=2,
+                    # random_state=0,
+                    # max_depth = "auto",
+                )
                 start = monotonic()
                 model.fit(train_set[:][0].numpy(), train_set[:][1].numpy())
                 pred_lab = model.predict(val_set[:][0].numpy())
@@ -306,7 +324,26 @@ def main():
 
             accuracy = (pred_lab == val_set[:][1].numpy()).sum().item() / pred_lab.size
             print("Accuracy: %.2f" % (accuracy * 100))
+            if args.polygons:
+                val_polygons = np.unique(val_set[:][2])
+                acc = []
+                for vp in val_polygons:
+                    vp_inds = val_set[:][2] == vp
+                    polygon_predictions, prediction_counts = np.unique(
+                        pred_lab[vp_inds], return_counts=True
+                    )
+                    polygon_predicted_class = polygon_predictions[
+                        np.argmax(prediction_counts)
+                    ]
+                    if polygon_predicted_class == val_set[vp_inds][1][0]:
+                        acc.append(True)
+                    else:
+                        acc.append(False)
+                print("Polygon accuracy: %d/%d" % (np.sum(acc), len(acc)))
             acc_res.append(accuracy)
+            if best_result is None or best_result[-1] < accuracy:
+                best_result = (val_set[:][1], pred_lab, pred_all, accuracy)
+
             if args.track:
                 mlflow.log_metric("Accuracy", accuracy, step=cnt)
 
@@ -319,7 +356,7 @@ def main():
             if args.track:
                 mlflow.log_metrics({"Acc. Average": acc_av, "Acc. Std": acc_std})
 
-        cm = _get_cm(val_set[:][1].numpy(), pred_lab, round_prec=4)
+        cm = _get_cm(best_result[0], best_result[1], round_prec=4)
         print("Confusion Matrix:")
         print(cm)
         if args.track:
@@ -334,9 +371,9 @@ def main():
                 mlflow.log_artifact(xls_path)
 
         if args.class_map:
-            data_out = np.zeros(np.prod(input_raster.data.shape[1:]))
-            data_out[mask_input.flatten()] = pred_all + 1
-            data_out = data_out.reshape(input_raster.data.shape[1:])
+            data_out = np.zeros(np.prod(raster_shape))
+            data_out[mask_valid.flatten()] = best_result[2] + 1
+            data_out = data_out.reshape(raster_shape)
 
             out_raster = gt_raster.copy()
             out_raster.data = np.expand_dims(data_out.astype(np.float32), 0)
