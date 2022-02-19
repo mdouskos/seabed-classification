@@ -64,7 +64,8 @@ def train_network(model, train_set, val_set, epochs=10, batch_size=2048, gpu=Fal
     for epoch in range(epochs):
         running_loss = 0.0
         for i, data in enumerate(train_loader, 0):
-            samples, labels = data
+            samples = data[0]
+            labels = data[1]
             samples = samples.type(torch.FloatTensor)
             labels = labels.type(torch.LongTensor)
             if gpu:

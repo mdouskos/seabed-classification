@@ -24,11 +24,12 @@ from utils.dataset import *
 
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import LinearSVC
+from sklearn.metrics import cohen_kappa_score
 
 from time import monotonic
 
 # np.random.seed(1234)
-# matplotlib.use('TkAgg')
+
 
 
 def parse_arguments():
@@ -192,6 +193,8 @@ def main():
 
     if d_emb > 0:
         print("Using positional embedding with dim %d and sigma %.3f" % (d_emb, sigma))
+        # sigma_vec = sigma/np.array(raster_shape)
+        # pos_vec = pos_data/np.expand_dims(raster_shape, 1)
         in_data, div_term = positional_encoding(data_pixels_n, pos_data, d_emb, sigma)
     else:
         in_data = data_pixels_n
@@ -223,6 +226,7 @@ def main():
             mlflow.set_tag("Model", args.model)
             mlflow.set_tag("PE", args.embedding_dim > 0)
         acc_res = []
+        kappa_res = []
         best_result = None
         pred_all = None
         for cnt, run in enumerate(range(args.runs)):
@@ -271,7 +275,7 @@ def main():
                 all_dataset = TensorDataset(torch.tensor(all_data_n))
 
             if args.model == "nn":
-                D_in = data_pixels_n.shape[1] + d_emb
+                D_in = data_pixels_n.shape[1] #+ d_emb
                 H1 = 512
                 H2 = 512
 
@@ -323,7 +327,8 @@ def main():
                 raise ValueError("Unknown model type %s" % args.model)
 
             accuracy = (pred_lab == val_set[:][1].numpy()).sum().item() / pred_lab.size
-            print("Accuracy: %.2f" % (accuracy * 100))
+            kappa_val = cohen_kappa_score(val_set[:][1], pred_lab)
+            print("Accuracy: %.2f, kappa: %.3f" % (accuracy * 100, kappa_val))
             if args.polygons:
                 val_polygons = np.unique(val_set[:][2])
                 acc = []
@@ -341,17 +346,22 @@ def main():
                         acc.append(False)
                 print("Polygon accuracy: %d/%d" % (np.sum(acc), len(acc)))
             acc_res.append(accuracy)
+            kappa_res.append(kappa_val)
             if best_result is None or best_result[-1] < accuracy:
-                best_result = (val_set[:][1], pred_lab, pred_all, accuracy)
+                best_result = (val_set[:][1], pred_lab, pred_all, kappa_val, accuracy)
 
             if args.track:
                 mlflow.log_metric("Accuracy", accuracy, step=cnt)
+                mlflow.log_metric("Kappa", accuracy, step=cnt)
 
         if len(acc_res) > 1:
             acc_av = np.mean(acc_res)
             acc_std = np.std(acc_res)
+            kappa_av = np.mean(kappa_res)
+            kappa_std = np.std(kappa_res)
             print(
-                "Results after %d runs: AP %f, sigma %f" % (args.runs, acc_av, acc_std)
+                "Results after %d runs: AP %f %s %f, kappa %f %s %f"
+                % (args.runs, acc_av, chr(177), acc_std, kappa_av, chr(177), kappa_std)
             )
             if args.track:
                 mlflow.log_metrics({"Acc. Average": acc_av, "Acc. Std": acc_std})
@@ -380,6 +390,8 @@ def main():
             out_raster.rio.to_raster(
                 os.path.join(args.output_dir, "out.tif"), dtype=np.uint8
             )
+            plt.imshow(data_out)
+            plt.show()
     # return
 
 
