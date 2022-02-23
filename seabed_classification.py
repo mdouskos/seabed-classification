@@ -3,15 +3,12 @@ import argparse
 from turtle import position
 
 import numpy as np
-import scipy
 
 from contextlib import nullcontext
 
-import rioxarray
-
-import matplotlib
 import matplotlib.pyplot as plt
 import mlflow
+from torch import div
 
 from torch.utils.data import TensorDataset
 
@@ -28,8 +25,7 @@ from sklearn.metrics import cohen_kappa_score
 
 from time import monotonic
 
-# np.random.seed(1234)
-
+np.random.seed(1234)
 
 
 def parse_arguments():
@@ -49,6 +45,15 @@ def parse_arguments():
         "--polygons", type=str, help="Path of polygon IDs raster", default=""
     )
     parser.add_argument("--bathy", type=str, help="Bathymetry layer", default="")
+    parser.add_argument(
+        "--input-val", type=str, help="Path of validation image", default=""
+    )
+    parser.add_argument(
+        "--gt-val", type=str, help="Path of reference validation image", default=""
+    )
+    parser.add_argument(
+        "--bathy-val", type=str, help="Validation bathymetry layer", default=""
+    )
     parser.add_argument("--runs", type=int, help="Number of runs", default=1)
     parser.add_argument(
         "--perc",
@@ -64,6 +69,7 @@ def parse_arguments():
         choices=("nn", "rf", "svm"),
     )
     parser.add_argument("--normalize", action="store_true", help="Normalize data")
+    parser.add_argument("--hist-match", action="store_true", help="Histogram matching")
     parser.add_argument(
         "--embedding-dim",
         type=int,
@@ -112,96 +118,38 @@ def main():
 
     args = parse_arguments()
 
-    print("Reading ground truth...", end=" ")
-    gt_raster = rioxarray.open_rasterio(get_file_loc(args.dataset_dir, args.gt))
-    if gt_raster.data.dtype != np.uint8:
-        gt_raster.data = gt_raster.data.astype(np.uint8)
-    mask_gt = np.all(gt_raster.data != gt_raster.rio.nodata, axis=0)
-    mask_cum = mask_gt
-    num_classes = np.unique(gt_raster.data).size - 1
-    print("done!")
-
-    print("Reading data...", end=" ")
-    input_raster = rioxarray.open_rasterio(get_file_loc(args.dataset_dir, args.input))
-    if input_raster.data.dtype != np.uint8:
-        input_raster.data = input_raster.data.astype(np.uint8)
-    mask_input = np.all(input_raster.data != input_raster.rio.nodata, axis=0)
-    mask_valid = mask_input
-    mask_cum = np.logical_and(mask_cum, mask_input)
-    raster_shape = input_raster.data.shape[1:]
-    print("done!")
-
+    polygons_file = None
+    bathy_file = None
     if args.polygons:
-        print("Reading polygon IDs...", end=" ")
-        poly_raster = rioxarray.open_rasterio(
-            get_file_loc(args.dataset_dir, args.polygons)
-        )
-        if poly_raster.data.dtype != np.uint8:
-            poly_raster.data = poly_raster.data.astype(np.uint8)
-        mask_poly = np.all(poly_raster.data != poly_raster.rio.nodata, axis=0)
-        assert np.all(
-            mask_gt == mask_poly
-        ), "GT mask does not correspond to polygon IDs mask"
-        print("done!")
-
+        polygons_file = get_file_loc(args.dataset_dir, args.polygons)
     if args.bathy:
-        print("Reading bathy...", end=" ")
-        bathy_raster = rioxarray.open_rasterio(
-            get_file_loc(args.dataset_dir, args.bathy)
-        )
-        # BPI = (
-        #     bathy_raster.data
-        #     - scipy.ndimage.uniform_filter(bathy_raster.data, 17, mode="constant")
-        # ).astype(np.int)
-        mask_bathy = np.all(bathy_raster.data != bathy_raster.rio.nodata, axis=0)
-        mask_cum = np.logical_and(mask_cum, mask_bathy)
-        mask_valid = np.logical_and(mask_valid, mask_bathy)
-        print("done!")
-
-    if args.plot_aligned:
-        plt.imshow(input_raster.data.transpose(1, 2, 0).astype(np.uint8))
-        if args.bathy:
-            bathy_show = bathy_raster.data[0, ...]
-            bathy_show[~mask_bathy] = np.nan
-            plt.imshow(bathy_show, alpha=0.5)
-        gt_show = gt_raster.data[0, ...].astype(np.float32)
-        gt_show[~mask_gt] = np.nan
-        plt.imshow(gt_show, cmap="Set1")
-        plt.show()
-
-    pos_data = np.where(mask_cum)
-    gt_filt = gt_raster.data[0, mask_cum] - 1
-    data_pixels = input_raster.data.reshape((3, -1))[:, mask_cum.flatten()].transpose()
-    if args.polygons:
-        poly_filt = poly_raster.data[0, mask_cum]
-    if args.bathy:
-        data_pixels = np.append(
-            data_pixels,
-            bathy_raster.data.flatten()[mask_cum.flatten(), np.newaxis],
-            # BPI.flatten()[mask_cum.flatten(), np.newaxis],
-            axis=1,
-        )
-    if args.normalize:
-        data_pixels_n = (data_pixels - np.mean(data_pixels, axis=0)) / np.std(
-            data_pixels, axis=0
-        )
-    else:
-        data_pixels_n = data_pixels
+        bathy_file = get_file_loc(args.dataset_dir, args.bathy)
+    data_train = process_data(
+        get_file_loc(args.dataset_dir, args.input),
+        get_file_loc(args.dataset_dir, args.gt),
+        polygons_file,
+        bathy_file,
+        args.normalize,
+        args.plot_aligned,
+    )
 
     d_emb = args.embedding_dim
     sigma = args.embedding_sigma
 
     if d_emb > 0:
-        print("Using positional embedding with dim %d and sigma %.3f" % (d_emb, sigma))
+        print("Using positional embedding with dim %d and sigma %.3g" % (d_emb, sigma))
+        pos_data = np.where(data_train["mask_gt"])
         # sigma_vec = sigma/np.array(raster_shape)
         # pos_vec = pos_data/np.expand_dims(raster_shape, 1)
-        in_data, div_term = positional_encoding(data_pixels_n, pos_data, d_emb, sigma)
+        in_data, div_term = positional_encoding(
+            data_train["data"], pos_data, d_emb, sigma
+        )
     else:
-        in_data = data_pixels_n
+        in_data = data_train["data"]
 
-    dataset_tensors = [torch.tensor(in_data), torch.tensor(gt_filt)]
+    dataset_tensors = [torch.tensor(in_data), torch.tensor(data_train["gt"])]
     if args.polygons:
-        dataset_tensors += [torch.tensor(poly_filt)]
+        dataset_tensors += [torch.tensor(data_train["polygons"])]
     tdata = TensorDataset(*dataset_tensors)
     len_data = len(tdata)
     print("Number of samples: %d" % len_data)
@@ -229,6 +177,16 @@ def main():
         kappa_res = []
         best_result = None
         pred_all = None
+        if not args.input_val:
+            data_valid = data_train
+        else:
+            data_valid = process_data(
+                args.input_val,
+                args.gt_val,
+                bathymetry_file=args.bathy_val,
+                normalize=args.normalize,
+            )
+
         for cnt, run in enumerate(range(args.runs)):
             print("Run %d/%d" % (run + 1, args.runs))
             if args.polygons:
@@ -240,25 +198,63 @@ def main():
                     "Training split ratio per class: [%s]"
                     % (" ".join(["{0:0.2f}".format(val) for val in split_ratios]))
                 )
-            else:
+            elif not args.input_val:
                 train_set, val_set = torch.utils.data.random_split(
-                    tdata, (train_size, val_size), torch.Generator().manual_seed(42)
+                    tdata,
+                    (train_size, val_size), torch.Generator().manual_seed(42)
                 )
                 # val_set = tdata
+            else:
+                train_set = tdata
+
+                data_val = data_valid["data"]
+
+                if args.hist_match:
+                    for ii in range(data_val.shape[1]):
+                        data_val[:, ii] = hist_match(
+                            data_val[:, ii], data_train["data"][:, ii]
+                        )
+
+                if d_emb > 0:
+                    print(
+                        "Using positional embedding with dim %d and sigma %.3f"
+                        % (d_emb, sigma)
+                    )
+                    pos_data_val = np.where(data_valid["mask_gt"])
+                    # sigma_vec = sigma/np.array(raster_shape)
+                    # pos_vec = pos_data/np.expand_dims(raster_shape, 1)
+                    in_data_val, _ = positional_encoding(
+                        data_val,
+                        pos_data_val,
+                        d_emb,
+                        sigma,
+                        div_term=div_term,
+                    )
+                else:
+                    in_data_val = data_val
+
+                dataset_tensors_val = [
+                    torch.tensor(in_data_val),
+                    torch.tensor(data_valid["gt"]),
+                ]
+                tdata_val = TensorDataset(*dataset_tensors_val)
+                val_set = tdata_val
 
             if args.class_map:
 
-                all_data = input_raster.data.reshape((3, -1))
-                all_data = all_data[:, mask_valid.flatten()].transpose()
+                all_data = data_valid["data_raster"].data.reshape((3, -1))
+                all_data = all_data[:, data_valid["mask_data"].flatten()].transpose()
                 if args.bathy:
                     all_data = np.append(
                         all_data,
-                        bathy_raster.data.flatten()[mask_valid.flatten(), np.newaxis],
+                        data_valid["bathy_raster"].data.flatten()[
+                            data_valid["mask_data"].flatten(), np.newaxis
+                        ],
                         axis=1,
                     )
                 if args.normalize:
-                    all_data_n = (all_data - np.mean(data_pixels, axis=0)) / np.std(
-                        data_pixels, axis=0
+                    all_data_n = (all_data - np.mean(all_data, axis=0)) / np.std(
+                        all_data, axis=0
                     )
                 else:
                     all_data_n = all_data
@@ -267,7 +263,7 @@ def main():
                     # pos_x, pos_y = np.meshgrid(
                     #     np.arange(raster_shape[1]), np.arange(raster_shape[0])
                     # )
-                    pos_all = np.where(mask_valid)
+                    pos_all = np.where(data_valid["mask_data"])
                     all_data_n, _ = positional_encoding(
                         all_data_n, pos_all, d_emb, sigma, div_term=div_term
                     )
@@ -275,10 +271,11 @@ def main():
                 all_dataset = TensorDataset(torch.tensor(all_data_n))
 
             if args.model == "nn":
-                D_in = data_pixels_n.shape[1] #+ d_emb
+                D_in = in_data.shape[1]  # + d_emb
                 H1 = 512
                 H2 = 512
 
+                num_classes = np.unique(data_train["gt"]).size
                 model = create_model(D_in, H1, H2, num_classes, args.gpu)
 
                 print("Training Neural Network for %d epochs" % args.epochs)
@@ -303,7 +300,7 @@ def main():
                 print("Training RF model")
                 model = RandomForestClassifier(
                     n_estimators=2,
-                    # random_state=0,
+                    random_state=0,
                     # max_depth = "auto",
                 )
                 start = monotonic()
@@ -381,11 +378,11 @@ def main():
                 mlflow.log_artifact(xls_path)
 
         if args.class_map:
-            data_out = np.zeros(np.prod(raster_shape))
-            data_out[mask_valid.flatten()] = best_result[2] + 1
-            data_out = data_out.reshape(raster_shape)
+            data_out = np.zeros(np.prod(data_valid["input_shape"]))
+            data_out[data_valid["mask_data"].flatten()] = best_result[2] + 1
+            data_out = data_out.reshape(data_valid["input_shape"])
 
-            out_raster = gt_raster.copy()
+            out_raster = data_valid["gt_raster"].copy()
             out_raster.data = np.expand_dims(data_out.astype(np.float32), 0)
             out_raster.rio.to_raster(
                 os.path.join(args.output_dir, "out.tif"), dtype=np.uint8

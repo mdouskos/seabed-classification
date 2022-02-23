@@ -2,7 +2,164 @@ import numpy as np
 import torch
 import math
 
-from torch.utils.data import TensorDataset
+import scipy
+
+import rioxarray
+
+import matplotlib.pyplot as plt
+
+
+def hist_match(source, template):
+    """
+    Adjust the pixel values of a grayscale image such that its histogram
+    matches that of a target image
+
+    Arguments:
+    -----------
+        source: np.ndarray
+            Image to transform; the histogram is computed over the flattened
+            array
+        template: np.ndarray
+            Template image; can have different dimensions to source
+    Returns:
+    -----------
+        matched: np.ndarray
+            The transformed output image
+    """
+
+    # oldshape = source.shape
+    # source = source.ravel()
+    # template = template.ravel()
+
+    # get the set of unique pixel values and their corresponding indices and
+    # counts
+    s_values, bin_idx, s_counts = np.unique(
+        source, return_inverse=True, return_counts=True
+    )
+    t_values, t_counts = np.unique(template, return_counts=True)
+
+    # take the cumsum of the counts and normalize by the number of pixels to
+    # get the empirical cumulative distribution functions for the source and
+    # template images (maps pixel value --> quantile)
+    s_quantiles = np.cumsum(s_counts).astype(np.float64)
+    s_quantiles /= s_quantiles[-1]
+    t_quantiles = np.cumsum(t_counts).astype(np.float64)
+    t_quantiles /= t_quantiles[-1]
+
+    # interpolate linearly to find the pixel values in the template image
+    # that correspond most closely to the quantiles in the source image
+    interp_t_values = np.interp(s_quantiles, t_quantiles, t_values)
+
+    return interp_t_values[bin_idx]  # .reshape(oldshape)
+
+
+def process_data(
+    input_file,
+    gt_file,
+    polygons_file=None,
+    bathymetry_file=None,
+    normalize=False,
+    plot=False,
+):
+    data_dict = dict.fromkeys(
+        [
+            "data",
+            "gt",
+            "data_raster",
+            "gt_raster",
+            "bathy_raster",
+            "mask_gt",
+            "mask_data",
+            "polygons",
+            "input_shape",
+        ]
+    )
+
+    print("Reading ground truth...", end=" ")
+    gt_raster = rioxarray.open_rasterio(gt_file)
+    data_dict["gt_raster"] = gt_raster
+    if gt_raster.data.dtype != np.uint8:
+        gt_raster.data = gt_raster.data.astype(np.uint8)
+    mask_gt = np.all(gt_raster.data != gt_raster.rio.nodata, axis=0)
+    mask_train = mask_gt
+    # num_classes = np.unique(gt_raster.data).size - 1
+    print("done!")
+
+    print("Reading data...", end=" ")
+    input_raster = rioxarray.open_rasterio(input_file)
+    data_dict["data_raster"] = input_raster
+    if input_raster.data.dtype != np.uint8:
+        input_raster.data = input_raster.data.astype(np.uint8)
+    mask_input = np.all(input_raster.data != input_raster.rio.nodata, axis=0)
+    mask_valid = mask_input
+    mask_train = np.logical_and(mask_train, mask_input)
+    data_dict["input_shape"] = input_raster.data.shape[1:]
+    print("done!")
+
+    if polygons_file:
+        print("Reading polygon IDs...", end=" ")
+        poly_raster = rioxarray.open_rasterio(polygons_file)
+        if poly_raster.data.dtype != np.uint8:
+            poly_raster.data = poly_raster.data.astype(np.uint8)
+        mask_poly = np.all(poly_raster.data != poly_raster.rio.nodata, axis=0)
+        assert np.all(
+            mask_gt == mask_poly
+        ), "GT mask does not correspond to polygon IDs mask"
+        print("done!")
+
+    if bathymetry_file:
+        print("Reading bathy...", end=" ")
+        bathy_raster = rioxarray.open_rasterio(bathymetry_file)
+        data_dict["bathy_raster"] = bathy_raster
+        # BPI = (
+        #     bathy_raster.data
+        #     - scipy.ndimage.uniform_filter(bathy_raster.data, 17, mode="constant")
+        # ).astype(np.int)
+        mask_bathy = np.all(bathy_raster.data != bathy_raster.rio.nodata, axis=0)
+        mask_train = np.logical_and(mask_train, mask_bathy)
+        mask_valid = np.logical_and(mask_valid, mask_bathy)
+        print("done!")
+
+    data_dict["gt"] = gt_raster.data[0, mask_train] - 1
+    data_pixels = input_raster.data.reshape((3, -1))[
+        :, mask_train.flatten()
+    ].transpose()
+    data_dict["mask_gt"] = mask_train
+    data_dict["mask_data"] = mask_valid
+
+    if polygons_file:
+        data_dict["polygons"] = poly_raster.data[0, mask_train]
+    if bathymetry_file:
+        data_pixels = np.append(
+            data_pixels,
+            bathy_raster.data.flatten()[mask_train.flatten(), np.newaxis],
+            # BPI.flatten()[mask_train.flatten(), np.newaxis],
+            axis=1,
+        )
+    if normalize:
+        data_pixels_n = (data_pixels - np.mean(data_pixels, axis=0)) / np.std(
+            data_pixels, axis=0
+        )
+        # data_pixels_n = (data_pixels - np.min(data_pixels, axis=0)) / (
+        #     np.max(data_pixels, axis=0) - np.min(data_pixels, axis=0)
+        # )
+    else:
+        data_pixels_n = data_pixels
+
+    data_dict["data"] = data_pixels_n
+
+    if plot:
+        plt.imshow(input_raster.data.transpose(1, 2, 0).astype(np.uint8))
+        if bathymetry_file:
+            bathy_show = bathy_raster.data[0, ...]
+            bathy_show[~mask_bathy] = np.nan
+            plt.imshow(bathy_show, alpha=0.5)
+        gt_show = gt_raster.data[0, ...].astype(np.float32)
+        gt_show[~mask_gt] = np.nan
+        plt.imshow(gt_show, cmap="Set1")
+        plt.show()
+
+    return data_dict
 
 
 def positional_encoding(data, pos, d_emb, sigma, div_term=None):
