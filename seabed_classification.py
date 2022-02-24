@@ -25,7 +25,7 @@ from sklearn.metrics import cohen_kappa_score
 
 from time import monotonic
 
-np.random.seed(1234)
+# np.random.seed(1234)
 
 
 def parse_arguments():
@@ -300,7 +300,7 @@ def main():
                 print("Training RF model")
                 model = RandomForestClassifier(
                     n_estimators=2,
-                    random_state=0,
+                    # random_state=0,
                     # max_depth = "auto",
                 )
                 start = monotonic()

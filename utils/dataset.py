@@ -196,8 +196,8 @@ def split_by_polygon_id(dataset, perc, return_sums=False):
         ctrain_poly_num = math.ceil(cnum_polys * perc)
         if cnum_polys == ctrain_poly_num:
             ctrain_poly_num = cnum_polys - 1
-        # cindices = cpolys[torch.randperm(len(cpolys))]
-        cindices = cpolys[:]
+        cindices = cpolys[torch.randperm(len(cpolys))]
+        # cindices = cpolys[:]
         ctrain_polys = cindices[:ctrain_poly_num]
 
         ctrain_indices = torch.any(
