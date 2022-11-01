@@ -383,7 +383,7 @@ def main():
             data_out = data_out.reshape(data_valid["input_shape"])
 
             out_raster = data_valid["gt_raster"].copy()
-            out_raster.data = np.expand_dims(data_out.astype(np.float32), 0)
+            out_raster.data = data_out.astype(np.float32)
             out_raster.rio.to_raster(
                 os.path.join(args.output_dir, "out.tif"), dtype=np.uint8
             )

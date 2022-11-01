@@ -1,3 +1,5 @@
+import pathlib 
+
 import numpy as np
 import torch
 import math
@@ -8,6 +10,7 @@ import rioxarray
 
 import matplotlib.pyplot as plt
 
+from skimage.morphology import dilation, disk
 
 def hist_match(source, template):
     """
@@ -52,6 +55,15 @@ def hist_match(source, template):
 
     return interp_t_values[bin_idx]  # .reshape(oldshape)
 
+def read_csv(datafile):
+    ifile = open(datafile, 'r')
+    data_all = []
+    ifile.readline()
+    for line in ifile:
+        file_data = line.strip().split(',')
+        data_all.append(file_data)
+    return np.array(data_all, dtype=np.float)
+    
 
 def process_data(
     input_file,
@@ -75,16 +87,6 @@ def process_data(
         ]
     )
 
-    print("Reading ground truth...", end=" ")
-    gt_raster = rioxarray.open_rasterio(gt_file)
-    data_dict["gt_raster"] = gt_raster
-    if gt_raster.data.dtype != np.uint8:
-        gt_raster.data = gt_raster.data.astype(np.uint8)
-    mask_gt = np.all(gt_raster.data != gt_raster.rio.nodata, axis=0)
-    mask_train = mask_gt
-    # num_classes = np.unique(gt_raster.data).size - 1
-    print("done!")
-
     print("Reading data...", end=" ")
     input_raster = rioxarray.open_rasterio(input_file)
     data_dict["data_raster"] = input_raster
@@ -92,16 +94,46 @@ def process_data(
         input_raster.data = input_raster.data.astype(np.uint8)
     mask_input = np.all(input_raster.data != input_raster.rio.nodata, axis=0)
     mask_valid = mask_input
-    mask_train = np.logical_and(mask_train, mask_input)
     data_dict["input_shape"] = input_raster.data.shape[1:]
     print("done!")
 
+    print("Reading ground truth...", end=" ")
+    file_ext = pathlib.Path(gt_file).suffix
+    if file_ext == '.tif':
+        gt_raster = rioxarray.open_rasterio(gt_file).isel(band=0)
+        # gt_raster.data = dilation(gt_raster.data, ball(9))
+    elif file_ext == ".csv" or file_ext == ".txt":
+        gt_raster = input_raster.isel(band=0)
+        gt_coords = read_csv(gt_file)
+        T = input_raster.rio.transform()
+        Tnp = np.array(T).reshape(3, 3)
+        Tnp_inv = np.linalg.inv(Tnp)
+        gt_cls = gt_coords[:, -1].copy()
+        gt_coords[:, -1] = 1
+        gt_data = np.zeros_like(input_raster)[0]
+        gt_indx = (Tnp_inv@gt_coords.T)[:2, :].astype(dtype=np.int16)
+        mask_gt_ind = np.all(gt_indx >= 0, 0) * \
+            (gt_indx[0, :] < gt_data.shape[1]) * (gt_indx[1, :] < gt_data.shape[0])
+        gt_indx = gt_indx[..., mask_gt_ind]
+        gt_indx_flat = np.ravel_multi_index([gt_indx[1, :], gt_indx[0, :]], gt_data.shape)
+        np.put(gt_data, gt_indx_flat, gt_cls[mask_gt_ind])
+        gt_raster.data = dilation(gt_data, disk(10))
+    data_dict["gt_raster"] = gt_raster
+    if gt_raster.data.dtype != np.uint8:
+        gt_raster.data = gt_raster.data.astype(np.uint8)
+    mask_gt = gt_raster.data != gt_raster.rio.nodata
+    mask_train = mask_gt.copy()
+    # num_classes = np.unique(gt_raster.data).size - 1
+    print("done!")
+
+    mask_train = np.logical_and(mask_train, mask_input)
+
     if polygons_file:
         print("Reading polygon IDs...", end=" ")
-        poly_raster = rioxarray.open_rasterio(polygons_file)
+        poly_raster = rioxarray.open_rasterio(polygons_file).isel(band=0)
         if poly_raster.data.dtype != np.uint8:
             poly_raster.data = poly_raster.data.astype(np.uint8)
-        mask_poly = np.all(poly_raster.data != poly_raster.rio.nodata, axis=0)
+        mask_poly = poly_raster.data != poly_raster.rio.nodata
         assert np.all(
             mask_gt == mask_poly
         ), "GT mask does not correspond to polygon IDs mask"
@@ -109,18 +141,18 @@ def process_data(
 
     if bathymetry_file:
         print("Reading bathy...", end=" ")
-        bathy_raster = rioxarray.open_rasterio(bathymetry_file)
+        bathy_raster = rioxarray.open_rasterio(bathymetry_file).isel(band=0)
         data_dict["bathy_raster"] = bathy_raster
         # BPI = (
         #     bathy_raster.data
         #     - scipy.ndimage.uniform_filter(bathy_raster.data, 17, mode="constant")
         # ).astype(np.int)
-        mask_bathy = np.all(bathy_raster.data != bathy_raster.rio.nodata, axis=0)
+        mask_bathy = bathy_raster.data != bathy_raster.rio.nodata
         mask_train = np.logical_and(mask_train, mask_bathy)
         mask_valid = np.logical_and(mask_valid, mask_bathy)
         print("done!")
 
-    data_dict["gt"] = gt_raster.data[0, mask_train] - 1
+    data_dict["gt"] = gt_raster.data[mask_train] - 1
     data_pixels = input_raster.data.reshape((3, -1))[
         :, mask_train.flatten()
     ].transpose()
@@ -128,7 +160,7 @@ def process_data(
     data_dict["mask_data"] = mask_valid
 
     if polygons_file:
-        data_dict["polygons"] = poly_raster.data[0, mask_train]
+        data_dict["polygons"] = poly_raster.data[mask_train]
     if bathymetry_file:
         data_pixels = np.append(
             data_pixels,
@@ -151,11 +183,11 @@ def process_data(
     if plot:
         plt.imshow(input_raster.data.transpose(1, 2, 0).astype(np.uint8))
         if bathymetry_file:
-            bathy_show = bathy_raster.data[0, ...]
+            bathy_show = bathy_raster.data
             bathy_show[~mask_bathy] = np.nan
             plt.imshow(bathy_show, alpha=0.5)
-        gt_show = gt_raster.data[0, ...].astype(np.float32)
-        gt_show[~mask_gt] = np.nan
+        gt_show = gt_raster.data.astype(np.float32)
+        gt_show[~mask_train] = np.nan
         plt.imshow(gt_show, cmap="Set1")
         plt.show()
 
