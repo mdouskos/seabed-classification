@@ -103,21 +103,40 @@ def process_data(
         gt_raster = rioxarray.open_rasterio(gt_file).isel(band=0)
         # gt_raster.data = dilation(gt_raster.data, ball(9))
     elif file_ext == ".csv" or file_ext == ".txt":
+        # build single-band dataset based on input data
         gt_raster = input_raster.isel(band=0)
+
+        # read sample points and corresponding classes from CSV file
         gt_coords = read_csv(gt_file)
+
+        # store sample classes
+        gt_cls = gt_coords[:, -1].copy()
+
+        # make coordinates homogeneous
+        gt_coords[:, -1] = 1
+
+        # initialize gt data array
+        gt_data = np.zeros_like(input_raster)[0]
+
+        # prepare inverse transfromation mapping sample points to pixel coords
         T = input_raster.rio.transform()
         Tnp = np.array(T).reshape(3, 3)
         Tnp_inv = np.linalg.inv(Tnp)
-        gt_cls = gt_coords[:, -1].copy()
-        gt_coords[:, -1] = 1
-        gt_data = np.zeros_like(input_raster)[0]
+        
+        # compute and filter pixel coordinates of samples
         gt_indx = (Tnp_inv@gt_coords.T)[:2, :].astype(dtype=np.int16)
         mask_gt_ind = np.all(gt_indx >= 0, 0) * \
             (gt_indx[0, :] < gt_data.shape[1]) * (gt_indx[1, :] < gt_data.shape[0])
         gt_indx = gt_indx[..., mask_gt_ind]
+
+        # assign classes to the data array
         gt_indx_flat = np.ravel_multi_index([gt_indx[1, :], gt_indx[0, :]], gt_data.shape)
         np.put(gt_data, gt_indx_flat, gt_cls[mask_gt_ind])
+
+        # expand gt regions
         gt_raster.data = dilation(gt_data, disk(10))
+
+    
     data_dict["gt_raster"] = gt_raster
     if gt_raster.data.dtype != np.uint8:
         gt_raster.data = gt_raster.data.astype(np.uint8)
