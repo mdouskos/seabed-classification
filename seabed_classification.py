@@ -32,6 +32,8 @@ from time import monotonic
 
 import json
 
+from libs.survey_data import SurveyData
+
 # np.random.seed(1234)
 
 
@@ -128,23 +130,28 @@ def main():
 
     args = parse_arguments()
 
-    polygons_file = None
-    bathy_file = None
-    dataset_path = pathlib.Path(args.dataset_dir)
-    for input in args.inputs:
-        input_json = dataset_path / input
-        with open(input_json) as f:
-            input_data = json.load(f)
+    # polygons_file = None
+    # bathy_file = None
+    # dataset_path = pathlib.Path(args.dataset_dir)
+    # for input in args.inputs:
+    #     input_json = dataset_path / input
+    #     with open(input_json) as f:
+    #         input_data = json.load(f)
 
-        data_train = process_data(
-            dataset_path / input_data["directory"] / input_data["backscatter"],
-            dataset_path / input_data["directory"] / input_data["samples"],
-            polygons_file,
-            bathy_file,
-            normalize=args.normalize,
-            plot=args.plot_aligned,
-        )
+    #     data_train = process_data(
+    #         dataset_path / input_data["directory"] / input_data["backscatter"],
+    #         dataset_path / input_data["directory"] / input_data["groundtruth"],
+    #         dataset_path / input_data["directory"] / input_data["polygons"],
+    #         bathy_file,
+    #         normalize=args.normalize,
+    #         plot=args.plot_aligned,
+    #     )
 
+    args = parse_arguments()
+    dataset_path = pathlib.Path(args.dataset_dir) / args.inputs[0]
+    region = SurveyData(dataset_path, dataset_dir=args.dataset_dir, mode='bs')
+
+    data_train = region.get_data()
     d_emb = args.embedding_dim
     sigma = args.embedding_sigma
 
