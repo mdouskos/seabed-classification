@@ -1,6 +1,6 @@
 import os
 import argparse
-from turtle import position
+import pathlib
 
 import numpy as np
 
@@ -8,22 +8,29 @@ from contextlib import nullcontext
 
 import matplotlib.pyplot as plt
 import mlflow
-from torch import div
+import torch
 
 from torch.utils.data import TensorDataset
 
-from libs.mlp import *
+from libs.mlp import create_model, model_eval, train_network
 
 import pandas as pd
 
 from utils.reporting import _get_cm
-from utils.dataset import *
+from utils.dataset import (
+    process_data,
+    positional_encoding,
+    split_by_polygon_id,
+    hist_match,
+)
 
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import LinearSVC
 from sklearn.metrics import cohen_kappa_score
 
 from time import monotonic
+
+import json
 
 # np.random.seed(1234)
 
@@ -33,32 +40,22 @@ def parse_arguments():
     parser.add_argument(
         "--dataset-dir",
         type=str,
-        help="Dataset directory (leave empty for individual files)",
+        help="Dataset directory (leave empty for current dir)",
     )
     parser.add_argument(
-        "--input", type=str, help="Path of input image", default="backscatter.tif"
+        "--inputs", type=str, nargs="*", help="Input areas (JSON files)"
     )
     parser.add_argument(
-        "--gt", type=str, help="Path of reference data image", default="GT.tif"
-    )
-    parser.add_argument(
-        "--polygons", type=str, help="Path of polygon IDs raster", default=""
-    )
-    parser.add_argument("--bathy", type=str, help="Bathymetry layer", default="")
-    parser.add_argument(
-        "--input-val", type=str, help="Path of validation image", default=""
-    )
-    parser.add_argument(
-        "--gt-val", type=str, help="Path of reference validation image", default=""
-    )
-    parser.add_argument(
-        "--bathy-val", type=str, help="Validation bathymetry layer", default=""
+        "--validation",
+        type=str,
+        nargs="*",
+        help="Validation areas (JSON files), leave empty for validation on input areas",
     )
     parser.add_argument("--runs", type=int, help="Number of runs", default=1)
     parser.add_argument(
         "--perc",
         type=float,
-        help="Percentage of training in decimal form ex. 0.9",
+        help="Percentage of training in decimal form ex. 0.7",
         default=0.7,
     )
     parser.add_argument(
@@ -95,6 +92,19 @@ def parse_arguments():
     parser.add_argument(
         "--plot-aligned", action="store_true", help="Plot aligned data layers"
     )
+    parser.add_argument(
+        "--input-val", type=str, help="Path of validation image", default=""
+    )
+    parser.add_argument("--use-polygons", action="store_true", help="Use polygon IDs")
+    parser.add_argument(
+        "--use-bathymetry", action="store_true", help="Use bathymetry as feature"
+    )
+    parser.add_argument(
+        "--sample-radius",
+        action="store_true",
+        help="Radius around samples (in meters)",
+        default=1,
+    )
     parser.add_argument("--output-dir", type=str, help="Output directory", default="./")
     parser.add_argument(
         "--xls-file", type=str, help="XLS filename for saving confusion matrix"
@@ -120,18 +130,20 @@ def main():
 
     polygons_file = None
     bathy_file = None
-    if args.polygons:
-        polygons_file = get_file_loc(args.dataset_dir, args.polygons)
-    if args.bathy:
-        bathy_file = get_file_loc(args.dataset_dir, args.bathy)
-    data_train = process_data(
-        get_file_loc(args.dataset_dir, args.input),
-        get_file_loc(args.dataset_dir, args.gt),
-        polygons_file,
-        bathy_file,
-        args.normalize,
-        args.plot_aligned,
-    )
+    dataset_path = pathlib.Path(args.dataset_dir)
+    for input in args.inputs:
+        input_json = dataset_path / input
+        with open(input_json) as f:
+            input_data = json.load(f)
+
+        data_train = process_data(
+            dataset_path / input_data["directory"] / input_data["backscatter"],
+            dataset_path / input_data["directory"] / input_data["samples"],
+            polygons_file,
+            bathy_file,
+            normalize=args.normalize,
+            plot=args.plot_aligned,
+        )
 
     d_emb = args.embedding_dim
     sigma = args.embedding_sigma
@@ -148,7 +160,7 @@ def main():
         in_data = data_train["data"]
 
     dataset_tensors = [torch.tensor(in_data), torch.tensor(data_train["gt"])]
-    if args.polygons:
+    if args.use_polygons:
         dataset_tensors += [torch.tensor(data_train["polygons"])]
     tdata = TensorDataset(*dataset_tensors)
     len_data = len(tdata)
@@ -157,11 +169,11 @@ def main():
     train_size = int(len_data * args.perc)
     val_size = len_data - train_size
 
-    with (mlflow.start_run() if args.track else nullcontext()) as ctxt:
+    with (mlflow.start_run() if args.track else nullcontext()):
         if args.track:
             param_dict = {
                 "Dataset": args.dataset_dir,
-                "Bathymetry": args.bathy,
+                "Bathymetry": args.use_bathymetry,
                 "Normalization": args.normalize,
                 "Runs": args.runs,
                 "Split": args.perc,
@@ -189,7 +201,7 @@ def main():
 
         for cnt, run in enumerate(range(args.runs)):
             print("Run %d/%d" % (run + 1, args.runs))
-            if args.polygons:
+            if args.use_polygons:
                 train_set, val_set, train_sum, val_sum = split_by_polygon_id(
                     tdata, args.perc, return_sums=True
                 )
@@ -200,8 +212,7 @@ def main():
                 )
             elif not args.input_val:
                 train_set, val_set = torch.utils.data.random_split(
-                    tdata,
-                    (train_size, val_size), torch.Generator().manual_seed(42)
+                    tdata, (train_size, val_size), torch.Generator().manual_seed(42)
                 )
                 # val_set = tdata
             else:
@@ -244,7 +255,7 @@ def main():
 
                 all_data = data_valid["data_raster"].data.reshape((3, -1))
                 all_data = all_data[:, data_valid["mask_data"].flatten()].transpose()
-                if args.bathy:
+                if args.use_bathymetry:
                     all_data = np.append(
                         all_data,
                         data_valid["bathy_raster"].data.flatten()[
@@ -326,7 +337,7 @@ def main():
             accuracy = (pred_lab == val_set[:][1].numpy()).sum().item() / pred_lab.size
             kappa_val = cohen_kappa_score(val_set[:][1], pred_lab)
             print("Accuracy: %.2f, kappa: %.3f" % (accuracy * 100, kappa_val))
-            if args.polygons:
+            if args.use_polygons:
                 val_polygons = np.unique(val_set[:][2])
                 acc = []
                 for vp in val_polygons:

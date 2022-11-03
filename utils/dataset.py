@@ -1,16 +1,15 @@
-import pathlib 
+import pathlib
 
 import numpy as np
 import torch
 import math
-
-import scipy
 
 import rioxarray
 
 import matplotlib.pyplot as plt
 
 from skimage.morphology import dilation, disk
+
 
 def hist_match(source, template):
     """
@@ -55,15 +54,16 @@ def hist_match(source, template):
 
     return interp_t_values[bin_idx]  # .reshape(oldshape)
 
+
 def read_csv(datafile):
-    ifile = open(datafile, 'r')
+    ifile = open(datafile, "r")
     data_all = []
     ifile.readline()
     for line in ifile:
-        file_data = line.strip().split(',')
+        file_data = line.strip().split(",")
         data_all.append(file_data)
     return np.array(data_all, dtype=np.float)
-    
+
 
 def process_data(
     input_file,
@@ -99,7 +99,7 @@ def process_data(
 
     print("Reading ground truth...", end=" ")
     file_ext = pathlib.Path(gt_file).suffix
-    if file_ext == '.tif':
+    if file_ext == ".tif":
         gt_raster = rioxarray.open_rasterio(gt_file).isel(band=0)
         # gt_raster.data = dilation(gt_raster.data, ball(9))
     elif file_ext == ".csv" or file_ext == ".txt":
@@ -122,21 +122,25 @@ def process_data(
         T = input_raster.rio.transform()
         Tnp = np.array(T).reshape(3, 3)
         Tnp_inv = np.linalg.inv(Tnp)
-        
+
         # compute and filter pixel coordinates of samples
-        gt_indx = (Tnp_inv@gt_coords.T)[:2, :].astype(dtype=np.int16)
-        mask_gt_ind = np.all(gt_indx >= 0, 0) * \
-            (gt_indx[0, :] < gt_data.shape[1]) * (gt_indx[1, :] < gt_data.shape[0])
+        gt_indx = (Tnp_inv @ gt_coords.T)[:2, :].astype(dtype=np.int16)
+        mask_gt_ind = (
+            np.all(gt_indx >= 0, 0)
+            * (gt_indx[0, :] < gt_data.shape[1])
+            * (gt_indx[1, :] < gt_data.shape[0])
+        )
         gt_indx = gt_indx[..., mask_gt_ind]
 
         # assign classes to the data array
-        gt_indx_flat = np.ravel_multi_index([gt_indx[1, :], gt_indx[0, :]], gt_data.shape)
+        gt_indx_flat = np.ravel_multi_index(
+            [gt_indx[1, :], gt_indx[0, :]], gt_data.shape
+        )
         np.put(gt_data, gt_indx_flat, gt_cls[mask_gt_ind])
 
         # expand gt regions
         gt_raster.data = dilation(gt_data, disk(10))
 
-    
     data_dict["gt_raster"] = gt_raster
     if gt_raster.data.dtype != np.uint8:
         gt_raster.data = gt_raster.data.astype(np.uint8)
