@@ -1,4 +1,4 @@
-from typing import Union, Type
+from typing import Union, Type, Literal
 from pathlib import Path
 
 import logging
@@ -12,7 +12,12 @@ from skimage.morphology import dilation, disk
 
 import pandas
 
-# import matplotlib.pyplot as plt
+
+from utils.dataset import positional_encoding
+
+from scipy.ndimage import uniform_filter
+
+import matplotlib.pyplot as plt
 
 logger = logging.getLogger(__name__)
 
@@ -40,38 +45,85 @@ class SurveyData:
         self.mode = mode
         self.__read_all_data()
 
-    def get_data(self, normalize=True):
+    def plot(self):
+        plt.imshow(self.backscatter.data.transpose(1, 2, 0).astype(np.uint8))
+        if hasattr(self, "bathymetry"):
+            bathy_show = self.bathymetry.data
+            bathy_show[~self.bathymetry_mask] = np.nan
+            plt.imshow(bathy_show, alpha=0.5)
+        gt_show = self.groundtruth.data.astype(np.float32)
+        gt_show[~self.groundtruth_mask] = np.nan
+        plt.imshow(gt_show, cmap="Set1")
+        plt.show()
+
+    def get_data(
+        self,
+        normalize: Literal["none", "minmax", "std"] = "none",
+        pe_dim: int = 0,
+        pe_sigma: float = 1.0,
+        bpi_radius: int = 17,
+    ):
         data_out = dict()
         mask_valid_gt = np.logical_and(self.backscatter_mask, self.groundtruth_mask)
         data_pixels = self.backscatter.data.reshape((3, -1))[
-            :, mask_valid_gt.flatten()
+            :, self.backscatter_mask.flatten()
         ].transpose()
+        mask_gt_seq = self.groundtruth_mask.flatten()[self.backscatter_mask.flatten()]
+        data_valid_gt = data_pixels[mask_gt_seq]
 
         if hasattr(self, "polygons"):
             data_out["polygons"] = self.polygons.data[mask_valid_gt]
-        # if bathymetry_file:
-        #     data_pixels = np.append(
-        #         data_pixels,
-        #         bathy_raster.data.flatten()[mask_train.flatten(), np.newaxis],
-        #         # BPI.flatten()[mask_train.flatten(), np.newaxis],
-        #         axis=1,
-        #     )
-        if normalize:
-            data_pixels_n = (data_pixels - np.mean(data_pixels, axis=0)) / np.std(
-                data_pixels, axis=0
+        if hasattr(self, "bathymetry"):
+            if self.mode == "bathy":
+                bathydata = self.bathymetry.data
+            elif self.mode == "bpi":
+                bathydata = (
+                    self.bathymetry.data
+                    - uniform_filter(self.bathymetry.data, bpi_radius, mode="constant")
+                ).astype(np.int)
+            data_pixels = np.append(
+                data_pixels,
+                bathydata.flatten()[self.backscatter_mask.flatten(), np.newaxis],
+                axis=1,
             )
-            # data_pixels_n = (data_pixels - np.min(data_pixels, axis=0)) / (
-            #     np.max(data_pixels, axis=0) - np.min(data_pixels, axis=0)
-            # )
+
+        if normalize == "std":
+            data_pixels_n = (
+                data_pixels
+                - np.mean(
+                    data_valid_gt,
+                    axis=0,
+                )
+            ) / np.std(data_valid_gt, axis=0)
+        elif normalize == "minmax":
+            data_pixels_n = (data_pixels - np.min(data_valid_gt, axis=0)) / (
+                np.max(data_valid_gt, axis=0) - np.min(data_valid_gt, axis=0)
+            )
         else:
             data_pixels_n = data_pixels
 
-        data_out["data"] = data_pixels_n
-        data_out["gt"] = self.groundtruth.data[mask_valid_gt] - 1
+        if pe_dim > 0:
+            logger.info(
+                f"Using positional embedding with dim {pe_dim} and sigma {pe_sigma}"
+            )
+            pos_data = np.where(self.backscatter_mask)
+            # sigma_vec = sigma/np.array(raster_shape)
+            # pos_vec = pos_data/np.expand_dims(raster_shape, 1)
+            data_pixels_n, div_term = positional_encoding(
+                data_pixels_n, pos_data, pe_dim, pe_sigma
+            )
+            self.div_term = div_term
+
+        data_out["data"] = data_pixels_n[mask_gt_seq, :]
+        data_out["data_all"] = data_pixels_n
+        data_out["gt"] = (
+            self.groundtruth.data[
+                np.logical_and(self.backscatter_mask, self.groundtruth_mask)
+            ]
+            - 1
+        )
         data_out["data_raster"] = self.backscatter
         data_out["mask_data"] = self.backscatter_mask
-        data_out["input_shape"] = self.backscatter.shape[1:]
-        data_out["gt_raster"] = self.groundtruth
         return data_out
 
     def __read_all_data(self):
