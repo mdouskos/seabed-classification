@@ -22,22 +22,6 @@ class NNSeabedClasifier(BaseEstimator):
         self.epochs = epochs
         self.gpu = gpu
 
-    def __compute_logits(self, X):
-        logits = np.empty((0, self.num_classes), dtype=np.uint8)
-
-        data_loader = torch.utils.data.DataLoader(
-            TensorDataset(torch.tensor(X)), batch_size=self.batch_size
-        )
-        with torch.no_grad():
-            for data in data_loader:
-                samples = data[0]
-                samples = samples.type(torch.FloatTensor)
-                if self.gpu:
-                    samples = samples.cuda()
-                batch_logits = self.seq(samples)
-                logits = np.vstack((logits, batch_logits.detach().cpu().numpy()))
-        return logits
-
     def __init_seq(self, D_in, num_classes, activation=torch.nn.ReLU, dropout=True):
         # Build sequential model from list of layers
         layerlist = [torch.nn.Linear(D_in, self.hidden_sizes[0])]
@@ -50,13 +34,13 @@ class NNSeabedClasifier(BaseEstimator):
         if dropout:
             layerlist.append(torch.nn.Dropout())
         layerlist.append(torch.nn.Linear(self.hidden_sizes[-1], num_classes))
-
+        layerlist.append(torch.nn.Softmax(dim=1))
         self.seq = torch.nn.Sequential(*layerlist)
 
         if self.gpu:
             self.seq = self.seq.cuda()
 
-        logger.info(str(self.seq))
+        logger.debug(str(self.seq))
 
     def fit(self, X, y):
         check_X_y(X, y)
@@ -92,14 +76,32 @@ class NNSeabedClasifier(BaseEstimator):
                 optimizer.step()
 
                 epoch_loss += outputs.shape[0] * loss.item()
-            # print(len(np.argmax(self.__compute_logits(X), 1)), len(y))
-            print(np.sum(np.argmax(self.__compute_logits(X), 1) == y)/len(y))
+            training_set_accuracy = np.sum(
+                np.argmax(self.__compute_logits(X), 1) == y
+            ) / len(y)
+            logger.debug(f"Training set accuracy: {training_set_accuracy:.3f}")
             logger.info(
                 "Epoch: {}/{}, loss: {}".format(
                     epoch + 1, self.epochs, epoch_loss / len(ytnsr)
                 )
             )
         self.fitted_ = True
+
+    def __compute_logits(self, X):
+        logits = np.empty((0, self.num_classes), dtype=np.uint8)
+
+        data_loader = torch.utils.data.DataLoader(
+            TensorDataset(torch.tensor(X)), batch_size=self.batch_size
+        )
+        with torch.no_grad():
+            for data in data_loader:
+                samples = data[0]
+                samples = samples.type(torch.FloatTensor)
+                if self.gpu:
+                    samples = samples.cuda()
+                batch_logits = self.seq(samples)
+                logits = np.vstack((logits, batch_logits.detach().cpu().numpy()))
+        return logits
 
     def predict_proba(self, X):
         check_is_fitted(self)
@@ -108,8 +110,10 @@ class NNSeabedClasifier(BaseEstimator):
         return self.__compute_logits(X)
 
     def predict(self, X):
-        logits = self.predict_proba(X)
-        return np.argmax(logits, 1)
+        check_is_fitted(self)
+        check_array(X)
+
+        return np.argmax(self.__compute_logits(X), 1)
 
 
 seabed_classifier_type = {

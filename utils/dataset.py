@@ -2,6 +2,18 @@ import numpy as np
 import math
 
 
+def normalize_data(X, Xref=None, normalization_type="std"):
+    if Xref is None:
+        Xref = X
+    if normalization_type == "std":
+        Xnorm = (X - np.mean(Xref, axis=0)) / np.std(Xref, axis=0)
+    elif normalization_type == "minmax":
+        Xnorm = (X - np.min(Xref, axis=0)) / (np.max(Xref, axis=0) - np.min(Xref, axis=0))
+    else:
+        ValueError(f"Unrecognlized normalization type {normalization_type}")
+    return Xnorm
+
+
 def hist_match(source, template):
     """
     Adjust the pixel values of a grayscale image such that its histogram
@@ -65,7 +77,7 @@ def positional_encoding(data, pos, d_emb, sigma, div_term=None):
     return out_data, div_term
 
 
-def split_by_polygon_id(X, y, polys, perc, return_sums=False):
+def split_by_polygon_id(X, y, polys, perc, shuffle=True, return_sums=False):
     classes = np.unique(y)
 
     train_indices = []
@@ -79,8 +91,10 @@ def split_by_polygon_id(X, y, polys, perc, return_sums=False):
         ctrain_poly_num = math.ceil(cnum_polys * perc)
         if cnum_polys == ctrain_poly_num:
             ctrain_poly_num = cnum_polys - 1
-        # cindices = cpolys[np.random.permutation(len(cpolys))]
-        cindices = cpolys[:]
+        if shuffle:
+            cindices = cpolys[np.random.permutation(len(cpolys))]
+        else:        
+            cindices = cpolys[:]
         ctrain_polys = cindices[:ctrain_poly_num]
 
         ctrain_indices = np.any(

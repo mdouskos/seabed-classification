@@ -19,11 +19,11 @@ from copy import deepcopy
 from utils.reporting import _get_cm
 from utils.dataset import (
     split_by_polygon_id,
+    normalize_data,
     hist_match,
 )
 
-
-from sklearn.metrics import cohen_kappa_score
+from sklearn.metrics import cohen_kappa_score, f1_score
 
 from time import monotonic
 
@@ -130,16 +130,19 @@ def main():
     args = parse_arguments()
     dataset_path = pathlib.Path(args.dataset_dir) / args.inputs[0]
     region = SurveyData(dataset_path, dataset_dir=args.dataset_dir, mode=args.mode)
+    if args.plot_aligned:
+        region.plot()
 
     data_train = region.get_data(
-        pe_dim=args.embedding_dim, pe_sigma=args.embedding_sigma
+        pe_dim=args.embedding_dim,
+        pe_sigma=args.embedding_sigma,
     )
 
     X = data_train["data"]
     y = data_train["gt"]
     polys = data_train["polygons"]
 
-    print("Number of samples: %d" % len(y))
+    logger.info(f"Number of samples: {len(y)}")
     with (mlflow.start_run() if args.track else nullcontext()):
         if args.track:
             param_dict = {
@@ -158,6 +161,7 @@ def main():
             mlflow.set_tag("PE", args.embedding_dim > 0)
         acc_res = []
         kappa_res = []
+        f1_res = []
         best_result = None
         pred_all = None
         if not args.input_val:
@@ -172,13 +176,13 @@ def main():
             # )
 
         for cnt, run in enumerate(range(args.runs)):
-            print("Run %d/%d" % (run + 1, args.runs))
+            logger.info(f"Run {run+1}/{args.runs}")
             if not args.input_val:
                 train_set, val_set, train_sum, val_sum = split_by_polygon_id(
                     X, y, polys, args.perc, return_sums=True
                 )
                 split_ratios = train_sum / (train_sum + val_sum)
-                print(
+                logger.info(
                     "Training split ratio per class: [%s]"
                     % (" ".join(["{0:0.2f}".format(val) for val in split_ratios]))
                 )
@@ -201,6 +205,15 @@ def main():
                 # tdata_val = TensorDataset(*dataset_tensors_val)
                 # val_set = tdata_val
 
+            X_train = train_set[0]
+            y_train = train_set[1]
+            X_val = val_set[0]
+            y_val = val_set[1]
+            poly_val = val_set[2]
+            if args.normalize != "none":
+                X_val = normalize_data(X_val, Xref=X_train)
+                X_train = normalize_data(X_train)
+
             options = dict()
             if args.model == "nn":
                 options = {
@@ -210,44 +223,48 @@ def main():
                     "gpu": args.gpu,
                 }
             elif args.model == "rf":
-                options = {"n_estimators": 2}
+                options = {"n_estimators": 2}  # , "random_state": 0}
 
             model = seabed_classifier_type[args.model](**options)
             logger.info(f"Training {seabed_classifier_name[args.model]} model")
             start = monotonic()
-            model.fit(train_set[0], train_set[1])
+            model.fit(X_train, y_train)
             tdiff = monotonic() - start
-            logger.info("Time elapsed: %f seconds" % tdiff)
+            logger.info(f"Time elapsed: {tdiff:.5f} seconds")
 
-            pred_lab = model.predict(val_set[0])               
+            pred_lab = model.predict(X_val)
 
             # Compute metrics for each run
-            accuracy = (pred_lab == val_set[1]).sum().item() / pred_lab.size
-            kappa_val = cohen_kappa_score(val_set[1], pred_lab)
-            print("Accuracy: %.2f, kappa: %.3f" % (accuracy * 100, kappa_val))
+            accuracy = (pred_lab == y_val).sum().item() / y_val.size
+            kappa_val = cohen_kappa_score(y_val, pred_lab)
+            f1_val = f1_score(y_val, pred_lab, average="macro")
+            logger.info(
+                f"Accuracy: {accuracy:.3f}, kappa: {kappa_val:.3f}, f1-score {f1_val:.3f}"
+            )
 
             # Compute polygon accuracy
-            val_polygons = np.unique(val_set[2])
+            val_polygons = np.unique(poly_val)
             acc = []
             for vp in val_polygons:
-                vp_inds = val_set[2] == vp
+                vp_inds = poly_val == vp
                 polygon_predictions, prediction_counts = np.unique(
                     pred_lab[vp_inds], return_counts=True
                 )
                 polygon_predicted_class = polygon_predictions[
                     np.argmax(prediction_counts)
                 ]
-                if polygon_predicted_class == val_set[1][vp_inds][0]:
+                if polygon_predicted_class == y_val[vp_inds][0]:
                     acc.append(True)
                 else:
                     acc.append(False)
-            print("Polygon accuracy: %d/%d" % (np.sum(acc), len(acc)))
+            logger.info(f"Polygon accuracy: {np.sum(acc)}/{len(acc)}")
 
             acc_res.append(accuracy)
             kappa_res.append(kappa_val)
+            f1_res.append(f1_val)
             if best_result is None or best_result[-1] < accuracy:
                 best_model = deepcopy(model)
-                best_result = (val_set[:][1], pred_lab, kappa_val, accuracy)
+                best_result = (y_val, pred_lab, kappa_val, accuracy)
 
             if args.track:
                 mlflow.log_metric("Accuracy", accuracy, step=cnt)
@@ -259,16 +276,19 @@ def main():
             acc_std = np.std(acc_res)
             kappa_av = np.mean(kappa_res)
             kappa_std = np.std(kappa_res)
-            print(
-                "Results after %d runs: AP %f %s %f, kappa %f %s %f"
-                % (args.runs, acc_av, chr(177), acc_std, kappa_av, chr(177), kappa_std)
+            f1_av = np.mean(f1_res)
+            f1_std = np.std(f1_res)
+            plusminus_symbol = chr(177)
+            logger.info(
+                f"Results after {args.runs} runs: AP {acc_av:.3f} {plusminus_symbol} {acc_std:.3f}"
+                + f", kappa {kappa_av:.3f} {plusminus_symbol} {kappa_std:.3f}"
+                + f", f1-score {f1_av:.3f} {plusminus_symbol} {f1_std:.3f}"
             )
             if args.track:
                 mlflow.log_metrics({"Acc. Average": acc_av, "Acc. Std": acc_std})
 
         cm = _get_cm(best_result[0], best_result[1], round_prec=4)
-        print("Confusion Matrix:")
-        print(cm)
+        logger.info(f"Confusion Matrix:\n{cm}")
         if args.track:
             mlflow.log_metric("Kappa", float(cm.PA[-2]))
 

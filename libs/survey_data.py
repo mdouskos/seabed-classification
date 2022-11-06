@@ -69,7 +69,7 @@ class SurveyData:
             :, self.backscatter_mask.flatten()
         ].transpose()
         mask_gt_seq = self.groundtruth_mask.flatten()[self.backscatter_mask.flatten()]
-        data_valid_gt = data_pixels[mask_gt_seq]
+        # data_valid_gt = data_pixels[mask_gt_seq]
 
         if hasattr(self, "polygons"):
             data_out["polygons"] = self.polygons.data[mask_valid_gt]
@@ -87,21 +87,6 @@ class SurveyData:
                 axis=1,
             )
 
-        if normalize == "std":
-            data_pixels_n = (
-                data_pixels
-                - np.mean(
-                    data_valid_gt,
-                    axis=0,
-                )
-            ) / np.std(data_valid_gt, axis=0)
-        elif normalize == "minmax":
-            data_pixels_n = (data_pixels - np.min(data_valid_gt, axis=0)) / (
-                np.max(data_valid_gt, axis=0) - np.min(data_valid_gt, axis=0)
-            )
-        else:
-            data_pixels_n = data_pixels
-
         if pe_dim > 0:
             logger.info(
                 f"Using positional embedding with dim {pe_dim} and sigma {pe_sigma}"
@@ -109,13 +94,13 @@ class SurveyData:
             pos_data = np.where(self.backscatter_mask)
             # sigma_vec = sigma/np.array(raster_shape)
             # pos_vec = pos_data/np.expand_dims(raster_shape, 1)
-            data_pixels_n, div_term = positional_encoding(
-                data_pixels_n, pos_data, pe_dim, pe_sigma
+            data_pixels, div_term = positional_encoding(
+                data_pixels, pos_data, pe_dim, pe_sigma
             )
             self.div_term = div_term
 
-        data_out["data"] = data_pixels_n[mask_gt_seq, :]
-        data_out["data_all"] = data_pixels_n
+        data_out["data"] = data_pixels[mask_gt_seq, :]
+        data_out["data_all"] = data_pixels
         data_out["gt"] = (
             self.groundtruth.data[
                 np.logical_and(self.backscatter_mask, self.groundtruth_mask)
