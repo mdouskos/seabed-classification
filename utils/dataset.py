@@ -10,7 +10,7 @@ def normalize_data(X, Xref=None, normalization_type="std"):
     elif normalization_type == "minmax":
         Xnorm = (X - np.min(Xref, axis=0)) / (np.max(Xref, axis=0) - np.min(Xref, axis=0))
     else:
-        ValueError(f"Unrecognlized normalization type {normalization_type}")
+        raise ValueError(f"Unrecognlized normalization type {normalization_type}")
     return Xnorm
 
 

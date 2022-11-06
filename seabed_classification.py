@@ -29,7 +29,7 @@ from time import monotonic
 
 from libs.survey_data import SurveyData
 
-# np.random.seed(1234)
+np.random.seed(1234)
 
 logger = logging.getLogger(__name__)
 
@@ -103,9 +103,7 @@ def parse_arguments():
     parser.add_argument(
         "--class-map", action="store_true", help="Compute classification map"
     )
-    parser.add_argument(
-        "--plot-aligned", action="store_true", help="Plot aligned data layers"
-    )
+    parser.add_argument("--plot", action="store_true", help="Plot data layers")
     parser.add_argument(
         "--input-val", type=str, help="Path of validation image", default=""
     )
@@ -125,23 +123,111 @@ def parse_arguments():
     return parser.parse_args()
 
 
+def __build_dataset_dict(dataset_dir, regions, mode, plot=False, **options):
+    X = None
+    y = None
+    polys = None
+    data_all = []
+    data_raster = []
+    data_raster_mask = []
+    polys_offset = 0
+    for i, region in enumerate(regions):
+        dataset_path = dataset_dir / region
+        region = SurveyData(dataset_path, dataset_dir=dataset_dir, mode=mode)
+        if plot:
+            region.plot()
+
+        data = region.get_data(**options)
+
+        if i == 0:
+            X = data["data"]
+            y = data["gt"]
+            polys = data["polygons"]
+        else:
+            X = np.vstack((X, data["data"]))
+            y = np.hstack((y, data["gt"]))
+            polys = np.hstack((polys, data["polygons"] + polys_offset))
+        data_all.append(data["data_all"])
+        data_raster.append(data["backscatter"])
+        data_raster_mask.append(data["backscatter_mask"])
+        polys_offset += np.max(polys)
+
+    data_dict = {
+        "X": X,
+        "y": y,
+        "polys": polys,
+        "data_all": data_all,
+        "raster": data_raster,
+        "raster_mask": data_raster_mask,
+    }
+
+    return data_dict
+
+
+def compute_metrics(y, predictions, polygons=None):
+    # Compute metrics for each run
+    accuracy = (predictions == y).sum().item() / y.size
+    kappa = cohen_kappa_score(y, predictions)
+    f1 = f1_score(y, predictions, average="macro")
+    logger.info(f"Accuracy: {accuracy:.3f}, kappa: {kappa:.3f}, f1-score {f1:.3f}")
+
+    # Compute polygon accuracy
+    if polygons is not None:
+        polygon_ids = np.unique(polygons)
+        acc = []
+        for vp in polygon_ids:
+            vp_inds = polygons == vp
+            polygon_predictions, prediction_counts = np.unique(
+                predictions[vp_inds], return_counts=True
+            )
+            polygon_predicted_class = polygon_predictions[np.argmax(prediction_counts)]
+            if polygon_predicted_class == y[vp_inds][0]:
+                acc.append(True)
+            else:
+                acc.append(False)
+        logger.info(f"Polygon accuracy: {np.sum(acc)}/{len(acc)}")
+
+    return {"accuracy": accuracy, "kappa": kappa, "f1-score": f1}
+
+
+def compute_classification_map(
+    model, data, raster, raster_mask, out_name="out.tif", plot=False
+):
+    pred_all = model.predict(data)
+    data_out = np.zeros_like(raster_mask, dtype=np.uint8)
+    data_out[raster_mask] = pred_all + 1
+
+    out_raster = raster.isel(band=0)
+    out_raster.data = data_out.astype(np.float32)
+    out_raster.rio.to_raster(out_name, dtype=np.uint8)
+    if plot:
+        plt.imshow(data_out)
+        plt.show()
+
+
 def main():
-
     args = parse_arguments()
-    dataset_path = pathlib.Path(args.dataset_dir) / args.inputs[0]
-    region = SurveyData(dataset_path, dataset_dir=args.dataset_dir, mode=args.mode)
-    if args.plot_aligned:
-        region.plot()
 
-    data_train = region.get_data(
-        pe_dim=args.embedding_dim,
-        pe_sigma=args.embedding_sigma,
+    data_proc_options = {
+        "pe_dim": args.embedding_dim,
+        "pe_sigma": args.embedding_sigma,
+        "dilation_radius": 15,
+        "morph_element": "square",
+    }
+    dataset_dir = pathlib.Path(args.dataset_dir)
+    data_train_dict = __build_dataset_dict(
+        dataset_dir, args.inputs, args.mode, **data_proc_options
     )
+    if args.validation is None:
+        data_val_dict = {}
+    else:
+        data_val_dict = __build_dataset_dict(
+            dataset_dir, args.validation, args.mode, **data_proc_options
+        )
 
-    X = data_train["data"]
-    y = data_train["gt"]
-    polys = data_train["polygons"]
-
+    X = data_train_dict["X"]
+    y = data_train_dict["y"]
+    polys = data_train_dict["polys"]
     logger.info(f"Number of samples: {len(y)}")
     with (mlflow.start_run() if args.track else nullcontext()):
         if args.track:
@@ -163,23 +249,13 @@ def main():
         kappa_res = []
         f1_res = []
         best_result = None
-        pred_all = None
-        if not args.input_val:
-            data_valid = data_train
-        else:
-            ValueError("Not implemented yet")
-            # data_valid = process_data(
-            #     args.input_val,
-            #     args.gt_val,
-            #     bathymetry_file=args.bathy_val,
-            #     normalize=args.normalize,
-            # )
 
         for cnt, run in enumerate(range(args.runs)):
             logger.info(f"Run {run+1}/{args.runs}")
-            if not args.input_val:
+            if len(data_val_dict) == 0:
+                data_val_dict = data_train_dict
                 train_set, val_set, train_sum, val_sum = split_by_polygon_id(
-                    X, y, polys, args.perc, return_sums=True
+                    X, y, polys, args.perc, return_sums=True, shuffle=False
                 )
                 split_ratios = train_sum / (train_sum + val_sum)
                 logger.info(
@@ -187,88 +263,56 @@ def main():
                     % (" ".join(["{0:0.2f}".format(val) for val in split_ratios]))
                 )
             else:
-                ValueError("Not implemented yet")
-                # train_set = tdata
-
-                # data_val = data_valid["data"]
-
-                # if args.hist_match:
-                #     for ii in range(data_val.shape[1]):
-                #         data_val[:, ii] = hist_match(
-                #             data_val[:, ii], data_train["data"][:, ii]
-                #         )
-
-                # dataset_tensors_val = [
-                #     torch.tensor(in_data_val),
-                #     torch.tensor(data_valid["gt"]),
-                # ]
-                # tdata_val = TensorDataset(*dataset_tensors_val)
-                # val_set = tdata_val
+                train_set = (data_train_dict["X"], data_train_dict["y"], None)
+                val_set = (data_val_dict["X"], data_val_dict["y"], None)
+                if args.hist_match:
+                    for dim in range(val_set[0].shape[1]):
+                        val_set[0][:, dim] = hist_match(val_set[0][:, dim], X[:, dim])
 
             X_train = train_set[0]
+            X_ref = X_train.copy()
             y_train = train_set[1]
             X_val = val_set[0]
             y_val = val_set[1]
             poly_val = val_set[2]
             if args.normalize != "none":
-                X_val = normalize_data(X_val, Xref=X_train)
+                X_val = normalize_data(X_val, Xref=X_ref)
                 X_train = normalize_data(X_train)
 
-            options = dict()
+            model_options = dict()
             if args.model == "nn":
-                options = {
+                model_options = {
                     "hidden_sizes": [512, 512],
                     "epochs": args.epochs,
                     "batch_size": args.batch,
                     "gpu": args.gpu,
                 }
             elif args.model == "rf":
-                options = {"n_estimators": 2}  # , "random_state": 0}
+                model_options = {"n_estimators": 2, "random_state": 0}
 
-            model = seabed_classifier_type[args.model](**options)
+            model = seabed_classifier_type[args.model](**model_options)
             logger.info(f"Training {seabed_classifier_name[args.model]} model")
             start = monotonic()
             model.fit(X_train, y_train)
             tdiff = monotonic() - start
             logger.info(f"Time elapsed: {tdiff:.5f} seconds")
 
-            pred_lab = model.predict(X_val)
+            pred_labels = model.predict(X_val)
 
-            # Compute metrics for each run
-            accuracy = (pred_lab == y_val).sum().item() / y_val.size
-            kappa_val = cohen_kappa_score(y_val, pred_lab)
-            f1_val = f1_score(y_val, pred_lab, average="macro")
-            logger.info(
-                f"Accuracy: {accuracy:.3f}, kappa: {kappa_val:.3f}, f1-score {f1_val:.3f}"
-            )
-
-            # Compute polygon accuracy
-            val_polygons = np.unique(poly_val)
-            acc = []
-            for vp in val_polygons:
-                vp_inds = poly_val == vp
-                polygon_predictions, prediction_counts = np.unique(
-                    pred_lab[vp_inds], return_counts=True
-                )
-                polygon_predicted_class = polygon_predictions[
-                    np.argmax(prediction_counts)
-                ]
-                if polygon_predicted_class == y_val[vp_inds][0]:
-                    acc.append(True)
-                else:
-                    acc.append(False)
-            logger.info(f"Polygon accuracy: {np.sum(acc)}/{len(acc)}")
-
-            acc_res.append(accuracy)
-            kappa_res.append(kappa_val)
-            f1_res.append(f1_val)
-            if best_result is None or best_result[-1] < accuracy:
-                best_model = deepcopy(model)
-                best_result = (y_val, pred_lab, kappa_val, accuracy)
+            metrics = compute_metrics(y_val, pred_labels, polygons=poly_val)
 
             if args.track:
-                mlflow.log_metric("Accuracy", accuracy, step=cnt)
-                mlflow.log_metric("Kappa", accuracy, step=cnt)
+                mlflow.log_metric("Accuracy", metrics["accuracy"], step=cnt)
+                mlflow.log_metric("Kappa", metrics["kappa"], step=cnt)
+                mlflow.log_metric("F1-score", metrics["f1-score"], step=cnt)
+
+            acc_res.append(metrics["accuracy"])
+            kappa_res.append(metrics["kappa"])
+            f1_res.append(metrics["f1-score"])
+
+            if best_result is None or best_result[-1] < metrics["accuracy"]:
+                best_model = deepcopy(model)
+                best_result = (y_val, pred_labels, metrics["accuracy"])
 
         # Compute metric statistics
         if len(acc_res) > 1:
@@ -289,11 +333,9 @@ def main():
 
         cm = _get_cm(best_result[0], best_result[1], round_prec=4)
         logger.info(f"Confusion Matrix:\n{cm}")
-        if args.track:
-            mlflow.log_metric("Kappa", float(cm.PA[-2]))
 
         if args.xls_file:
-            xls_path = args.output_dir + "/" + args.xls_file + ".xlsx"
+            xls_path = pathlib.Path(args.output_dir) / args.xls_file + ".xlsx"
             writer = pd.ExcelWriter(xls_path)
             cm.to_excel(writer, "CM")
             writer.save()
@@ -301,18 +343,26 @@ def main():
                 mlflow.log_artifact(xls_path)
 
         if args.class_map:
-            pred_all = best_model.predict(data_valid["data_all"])
-            data_out = np.zeros_like(data_valid["mask_data"], dtype=np.uint8)
-            data_out[data_valid["mask_data"]] = pred_all + 1
+            data = data_val_dict["data_all"]
+            raster = data_val_dict["raster"]
+            raster_mask = data_val_dict["raster_mask"]
+            output_dir = pathlib.Path(args.output_dir)
+            for i in range(len(data)):
+                out_name = output_dir / f"out-{i}.tif"
+                if args.normalize != "none":
+                    data_all = normalize_data(data[i], Xref=X_ref)
+                else:
+                    data_all = data[i]
+                compute_classification_map(
+                    best_model,
+                    data_all,
+                    raster[i],
+                    raster_mask[i],
+                    out_name,
+                    args.plot,
+                )
 
-            out_raster = data_valid["data_raster"].isel(band=0)
-            out_raster.data = data_out.astype(np.float32)
-            out_raster.rio.to_raster(
-                pathlib.Path(args.output_dir) / "out.tif", dtype=np.uint8
-            )
-            plt.imshow(data_out)
-            plt.show()
-    # return
+    return
 
 
 if __name__ == "__main__":
