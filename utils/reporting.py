@@ -5,10 +5,11 @@ import pandas as pd
 # import openpyxl
 
 
-def _get_cm(y_gt, y_pred, labels=None, round_prec=2):
+def compute_cm(y_gt, y_pred, labels=None, round_prec=2, cls_names=None, xls_path=None):
     # compute metrics
     cm = metr.confusion_matrix(y_gt, y_pred)
-    kappa = metr.cohen_kappa_score(y_gt, y_pred)
+    # kappa = metr.cohen_kappa_score(y_gt, y_pred)
+    f1_score = metr.f1_score(y_gt, y_pred, average="macro")
     OA = metr.accuracy_score(y_gt, y_pred)
     UA = metr.precision_score(y_gt, y_pred, average=None)
     # UA_avg  = metr.precision_score   (y_gt, y_pred, average='weighted')
@@ -30,8 +31,12 @@ def _get_cm(y_gt, y_pred, labels=None, round_prec=2):
     if labels is None:
         labels = []
         for i in range(1, sz1 + 1):
-            labels.append("Class " + str(i))
-    
+            if cls_names is not None:
+                assert len(cls_names) == sz1, f"{sz1} class names should be provided"
+                labels.append(cls_names[i - 1])
+            else:
+                labels.append("Class " + str(i))
+
     # first row
     first_row = []
     first_row.extend(labels)
@@ -49,8 +54,8 @@ def _get_cm(y_gt, y_pred, labels=None, round_prec=2):
     for sublist in cm_list:
         if idx == sz1:
             cm_list[idx] = sublist
-            sublist[-2] = "kappa:"
-            sublist[-1] = round(kappa, round_prec)
+            sublist[-2] = "f1:"
+            sublist[-1] = round(f1_score, round_prec)
         elif idx == sz1 + 1:
             sublist[-2] = "OA:"
             sublist[-1] = round(OA, round_prec)
@@ -62,33 +67,34 @@ def _get_cm(y_gt, y_pred, labels=None, round_prec=2):
     df.columns = first_row
     df.index = first_col
 
-    return df
-
-def confusion_matrix(datapath, pred_nm, gt_nm, xls_nm, labels=None, sheet_nm="CM"):
-
-    # load data
-    # (pred, geoTransform, proj, drv_name) = geoimread(datapath + pred_nm)
-    pred = np.load(pred_nm)
-    gt = np.load(gt_nm)
-
-    # convert to int
-    gt = gt.astype("int")
-    pred = pred.astype("int")
-
-    # remove background pixels
-    gt0 = gt > 0
-    y_gt = gt[gt0]
-    y_pred = pred[gt0]
-
-    pr0 = y_pred > 0
-    y_gt = y_gt[pr0]
-    y_pred = y_pred[pr0]
-
-    df = _get_cm(y_gt, y_pred, labels)
-
-    # Write to xls
-    writer = pd.ExcelWriter(datapath + "/" + xls_nm + ".xlsx")
-    df.to_excel(writer, sheet_nm)
-    writer.save()
+    if xls_path:
+        writer = pd.ExcelWriter(xls_path)
+        df.to_excel(writer, "CM")
+        writer.save()
 
     return df
+
+
+def compute_metrics(y, predictions, polygons=None):
+    # Compute metrics for each run
+    accuracy = (predictions == y).sum().item() / y.size
+    kappa = metr.cohen_kappa_score(y, predictions)
+    f1 = metr.f1_score(y, predictions, average="macro")
+
+    acc = None
+    # Compute polygon accuracy
+    if polygons is not None:
+        polygon_ids = np.unique(polygons)
+        acc = []
+        for vp in polygon_ids:
+            vp_inds = polygons == vp
+            polygon_predictions, prediction_counts = np.unique(
+                predictions[vp_inds], return_counts=True
+            )
+            polygon_predicted_class = polygon_predictions[np.argmax(prediction_counts)]
+            if polygon_predicted_class == y[vp_inds][0]:
+                acc.append(True)
+            else:
+                acc.append(False)
+
+    return {"accuracy": accuracy, "kappa": kappa, "f1-score": f1, "polygon": acc}

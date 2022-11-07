@@ -29,6 +29,9 @@ class SurveyData:
         data_description: Union[str, Type[Path], dict],
         dataset_dir: Union[str, Type[Path]] = None,
         mode: str = "bs",
+        X_field: str = "X",
+        Y_field: str = "Y",
+        taxonomy: Literal["folk 5", "folk 7"] = "folk 7"
     ):
         if type(data_description) == str:
             data_description = Path(data_description)
@@ -41,6 +44,9 @@ class SurveyData:
             with open(data_description) as f:
                 data_description = json.load(f)
 
+        self.X_field = X_field
+        self.Y_field = Y_field
+        self.taxonomy = taxonomy
         self.dataset_dir = dataset_dir
         self.data_description = data_description
         self.mode = mode
@@ -52,14 +58,14 @@ class SurveyData:
             bathy_show = self.bathymetry.data
             bathy_show[~self.bathymetry_mask] = np.nan
             plt.imshow(bathy_show, alpha=0.5)
-        gt_show = self.groundtruth.data.astype(np.float32)
-        gt_show[~self.groundtruth_mask] = np.nan
-        plt.imshow(gt_show, cmap="Set1")
+        if hasattr(self, "groundtruth"):
+            gt_show = self.groundtruth.data.astype(np.float32)
+            gt_show[~self.groundtruth_mask] = np.nan
+            plt.imshow(gt_show, cmap="Set1")
         plt.show()
 
     def get_data(
         self,
-        normalize: Literal["none", "minmax", "std"] = "none",
         pe_dim: int = 0,
         pe_sigma: float = 1.0,
         bpi_radius: int = 17,
@@ -141,9 +147,10 @@ class SurveyData:
         return data_out
 
     def __read_all_data(self):
+        logger.info(f"Reading data from {self.data_description['description']}")
         self.__read_raster("backscatter", dtype=np.uint8)
         if "samples" in self.data_description:
-            self.__read_samples(dilation_r=3)
+            self.__read_samples()
         elif "groundtruth" in self.data_description:
             self.__read_gt()
 
@@ -160,13 +167,16 @@ class SurveyData:
 
     def __read_raster(self, key, n_bands=3, dtype=None):
         assert key in self.data_description, f"Unknown key: {key}"
-        raster_file = self.data_description[key]
+        if key == "groundtruth":
+            raster_file = self.data_description[key][self.taxonomy]
+        else:
+            raster_file = self.data_description[key]
         assert Path(raster_file).suffix == ".tif"
         logger.info("Reading " + raster_file + "...")
         raster_file = (
             self.dataset_dir
             / Path(self.data_description["directory"])
-            / self.data_description[key]
+            / raster_file
         )
         raster = rioxarray.open_rasterio(raster_file)
         if n_bands == 1:
@@ -184,10 +194,6 @@ class SurveyData:
     def __read_samples(
         self,
         key: str = "samples",
-        dilation_r: int = 10,
-        Xfld: str = "X",
-        Yfld: str = "Y",
-        CIDfld: str = "Class ID",
     ):
         assert hasattr(self, "backscatter")
         samples_file = self.data_description[key]
@@ -195,6 +201,11 @@ class SurveyData:
         samples_file = (
             self.dataset_dir / Path(self.data_description["directory"]) / samples_file
         )
+        if self.taxonomy == "folk 7":
+            cls_field = "Class ID 7"
+        elif self.taxonomy == "folk 5":
+            cls_field = "Class ID 5"
+
         logger.info("Reading sample file...")
         # build single-band dataset based on input data
         gt_raster = self.backscatter.isel(band=0)
@@ -206,11 +217,11 @@ class SurveyData:
 
         self.n_samples = len(gt_df)
         # store sample classes
-        gt_cls = gt_df[[CIDfld]].to_numpy()[:, 0]
+        gt_cls = gt_df[[cls_field]].to_numpy()[:, 0]
         gt_ids = np.arange(1, len(gt_cls) + 1)
 
         # make coordinates homogeneous
-        gt_coords = gt_df[[Xfld, Yfld]].to_numpy()
+        gt_coords = gt_df[[self.X_field, self.Y_field]].to_numpy()
         gt_coords = np.hstack((gt_coords, np.ones((len(gt_df), 1))))
 
         # prepare inverse transfromation mapping sample points to pixel coords
