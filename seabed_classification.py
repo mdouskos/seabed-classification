@@ -123,13 +123,14 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def __build_dataset_dict(dataset_dir, regions, mode, plot=False, **options):
+def build_dataset_dict(dataset_dir, regions, mode, plot=False, **options):
     X = None
     y = None
     polys = None
     data_all = []
     data_raster = []
     data_raster_mask = []
+    data_names = []
     polys_offset = 0
     for i, region in enumerate(regions):
         dataset_path = dataset_dir / region
@@ -150,6 +151,7 @@ def __build_dataset_dict(dataset_dir, regions, mode, plot=False, **options):
         data_all.append(data["data_all"])
         data_raster.append(data["backscatter"])
         data_raster_mask.append(data["backscatter_mask"])
+        data_names.append(data["name"])
         polys_offset += np.max(polys)
 
     data_dict = {
@@ -159,6 +161,7 @@ def __build_dataset_dict(dataset_dir, regions, mode, plot=False, **options):
         "data_all": data_all,
         "raster": data_raster,
         "raster_mask": data_raster_mask,
+        "names": data_names
     }
 
     return data_dict
@@ -215,13 +218,13 @@ def main():
         "morph_element": "square",
     }
     dataset_dir = pathlib.Path(args.dataset_dir)
-    data_train_dict = __build_dataset_dict(
+    data_train_dict = build_dataset_dict(
         dataset_dir, args.inputs, args.mode, **data_proc_options
     )
     if args.validation is None:
         data_val_dict = {}
     else:
-        data_val_dict = __build_dataset_dict(
+        data_val_dict = build_dataset_dict(
             dataset_dir, args.validation, args.mode, **data_proc_options
         )
 
@@ -263,11 +266,10 @@ def main():
                     % (" ".join(["{0:0.2f}".format(val) for val in split_ratios]))
                 )
             else:
-                train_set = (data_train_dict["X"], data_train_dict["y"], None)
-                val_set = (data_val_dict["X"], data_val_dict["y"], None)
+                train_set = [data_train_dict["X"], data_train_dict["y"], None]
+                val_set = [data_val_dict["X"], data_val_dict["y"], None]
                 if args.hist_match:
-                    for dim in range(val_set[0].shape[1]):
-                        val_set[0][:, dim] = hist_match(val_set[0][:, dim], X[:, dim])
+                    val_set[0] = hist_match(val_set[0], X)
 
             X_train = train_set[0]
             X_ref = X_train.copy()
@@ -276,8 +278,10 @@ def main():
             y_val = val_set[1]
             poly_val = val_set[2]
             if args.normalize != "none":
-                X_val = normalize_data(X_val, Xref=X_ref)
-                X_train = normalize_data(X_train)
+                X_val = normalize_data(
+                    X_val, Xref=X_ref, normalization_type=args.normalize
+                )
+                X_train = normalize_data(X_train, normalization_type=args.normalize)
 
             model_options = dict()
             if args.model == "nn":
@@ -346,11 +350,14 @@ def main():
             data = data_val_dict["data_all"]
             raster = data_val_dict["raster"]
             raster_mask = data_val_dict["raster_mask"]
+            names = data_val_dict["names"]
             output_dir = pathlib.Path(args.output_dir)
             for i in range(len(data)):
-                out_name = output_dir / f"out-{i}.tif"
+                out_name = output_dir / f"cmap_{names[i]}.tif"
                 if args.normalize != "none":
-                    data_all = normalize_data(data[i], Xref=X_ref)
+                    data_all = normalize_data(
+                        data[i], Xref=X_ref, normalization_type=args.normalize
+                    )
                 else:
                     data_all = data[i]
                 compute_classification_map(

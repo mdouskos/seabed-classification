@@ -8,7 +8,9 @@ def normalize_data(X, Xref=None, normalization_type="std"):
     if normalization_type == "std":
         Xnorm = (X - np.mean(Xref, axis=0)) / np.std(Xref, axis=0)
     elif normalization_type == "minmax":
-        Xnorm = (X - np.min(Xref, axis=0)) / (np.max(Xref, axis=0) - np.min(Xref, axis=0))
+        Xnorm = (X - np.min(Xref, axis=0)) / (
+            np.max(Xref, axis=0) - np.min(Xref, axis=0)
+        )
     else:
         raise ValueError(f"Unrecognlized normalization type {normalization_type}")
     return Xnorm
@@ -36,26 +38,31 @@ def hist_match(source, template):
     # source = source.ravel()
     # template = template.ravel()
 
-    # get the set of unique pixel values and their corresponding indices and
-    # counts
-    s_values, bin_idx, s_counts = np.unique(
-        source, return_inverse=True, return_counts=True
-    )
-    t_values, t_counts = np.unique(template, return_counts=True)
+    result = np.zeros_like(source)
 
-    # take the cumsum of the counts and normalize by the number of pixels to
-    # get the empirical cumulative distribution functions for the source and
-    # template images (maps pixel value --> quantile)
-    s_quantiles = np.cumsum(s_counts).astype(np.float64)
-    s_quantiles /= s_quantiles[-1]
-    t_quantiles = np.cumsum(t_counts).astype(np.float64)
-    t_quantiles /= t_quantiles[-1]
+    for dim in range(source.shape[1]):
+        # get the set of unique pixel values and their corresponding indices and
+        # counts
+        _, bin_idx, s_counts = np.unique(
+            source[:, dim], return_inverse=True, return_counts=True
+        )
+        t_values, t_counts = np.unique(template[:, dim], return_counts=True)
 
-    # interpolate linearly to find the pixel values in the template image
-    # that correspond most closely to the quantiles in the source image
-    interp_t_values = np.interp(s_quantiles, t_quantiles, t_values)
+        # take the cumsum of the counts and normalize by the number of pixels to
+        # get the empirical cumulative distribution functions for the source and
+        # template images (maps pixel value --> quantile)
+        s_quantiles = np.cumsum(s_counts).astype(np.float64)
+        s_quantiles /= s_quantiles[-1]
+        t_quantiles = np.cumsum(t_counts).astype(np.float64)
+        t_quantiles /= t_quantiles[-1]
 
-    return interp_t_values[bin_idx]  # .reshape(oldshape)
+        # interpolate linearly to find the pixel values in the template image
+        # that correspond most closely to the quantiles in the source image
+        interp_t_values = np.interp(s_quantiles, t_quantiles, t_values)
+
+        result[:, dim] = interp_t_values[bin_idx]  # .reshape(oldshape)
+
+    return result
 
 
 def positional_encoding(data, pos, d_emb, sigma, div_term=None):
@@ -93,7 +100,7 @@ def split_by_polygon_id(X, y, polys, perc, shuffle=True, return_sums=False):
             ctrain_poly_num = cnum_polys - 1
         if shuffle:
             cindices = cpolys[np.random.permutation(len(cpolys))]
-        else:        
+        else:
             cindices = cpolys[:]
         ctrain_polys = cindices[:ctrain_poly_num]
 

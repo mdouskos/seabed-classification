@@ -75,9 +75,7 @@ class SurveyData:
             self.groundtruth.data = np.zeros_like(self.polygons.data)
             # expand gt regions
             if morph_element == "disk":
-                self.polygons.data = dilation(
-                    self.polygons.data, disk(dilation_radius)
-                )
+                self.polygons.data = dilation(self.polygons.data, disk(dilation_radius))
             elif morph_element == "square":
                 self.polygons.data = convolve1d(
                     convolve1d(
@@ -101,7 +99,7 @@ class SurveyData:
         ].transpose()
         mask_gt_seq = self.groundtruth_mask.flatten()[self.backscatter_mask.flatten()]
         # data_valid_gt = data_pixels[mask_gt_seq]
-            
+
         if hasattr(self, "bathymetry"):
             if self.mode == "bathy":
                 bathydata = self.bathymetry.data
@@ -128,6 +126,7 @@ class SurveyData:
             )
             self.div_term = div_term
 
+        data_out["name"] = self.data_description["name"]
         data_out["data"] = data_pixels[mask_gt_seq, :]
         data_out["data_all"] = data_pixels
         data_out["gt"] = (
