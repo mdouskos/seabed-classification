@@ -5,7 +5,11 @@ import logging
 
 import numpy as np
 
+from contextlib import nullcontext
+
 import matplotlib.pyplot as plt
+
+import mlflow
 
 from libs.seabed_classifier import seabed_classifier_type, seabed_classifier_name
 
@@ -56,7 +60,7 @@ def parse_arguments():
         "--taxonomy",
         type=str,
         help="Specify taxonomy type",
-        default="folk 7",
+        default="folk 5",
         choices=("folk 5", "folk 7"),
     )
     parser.add_argument(
@@ -71,7 +75,7 @@ def parse_arguments():
         type=str,
         help="Normalization type",
         default="std",
-        choices=("none", "minmax", "std"),
+        choices=("none", "minmax", "std", "range"),
     )
     parser.add_argument(
         "--mode",
@@ -99,6 +103,9 @@ def parse_arguments():
     parser.add_argument(
         "--batch", type=int, help="Batch size for training MLP", default=2048
     )
+    parser.add_argument(
+        "--nn-size", type=int, help="Size of MLP hidden layers", default=512
+    )
     parser.add_argument("--gpu", action="store_true", help="Use GPU acceleration")
     parser.add_argument(
         "--class-map", action="store_true", help="Compute classification map"
@@ -120,6 +127,9 @@ def parse_arguments():
     parser.add_argument(
         "--xls-file", type=str, help="XLS filename for saving confusion matrix"
     )
+    parser.add_argument(
+        "--track", action="store_true", help="Track experiments with mlflow"
+    )
     return parser.parse_args()
 
 
@@ -132,7 +142,13 @@ cls_name_maps = {
 
 
 def build_dataset_dict(
-    dataset_dir, regions, mode, plot=False, taxonomy="folk 7", **options
+    dataset_dir,
+    regions,
+    mode,
+    plot=False,
+    taxonomy="folk 7",
+    samples_key="samples",
+    **options,
 ):
     X = None
     y = None
@@ -145,7 +161,11 @@ def build_dataset_dict(
     for i, region in enumerate(regions):
         dataset_path = dataset_dir / region
         region = SurveyData(
-            dataset_path, dataset_dir=dataset_dir, mode=mode, taxonomy=taxonomy
+            dataset_path,
+            dataset_dir=dataset_dir,
+            mode=mode,
+            taxonomy=taxonomy,
+            samples_key=samples_key,
         )
         if plot:
             region.plot()
@@ -180,10 +200,12 @@ def build_dataset_dict(
 
 
 def compute_classification_map(
-    model, data, raster, raster_mask, out_name="out.tif", plot=False
+    model, data, raster, raster_mask, out_name="out.tif", id_map=None, plot=False
 ):
     pred_all = model.predict(data)
     data_out = np.zeros_like(raster_mask, dtype=np.uint8)
+    if id_map is not None:
+        pred_all = id_map[pred_all]
     data_out[raster_mask] = pred_all + 1
 
     out_raster = raster.isel(band=0)
@@ -211,6 +233,7 @@ def main():
         mode=args.mode,
         taxonomy=args.taxonomy,
         plot=args.plot,
+        # samples_key="samples_train",
         **data_proc_options,
     )
     if args.validation is None:
@@ -221,6 +244,7 @@ def main():
             args.validation,
             mode=args.mode,
             taxonomy=args.taxonomy,
+            # samples_key="samples_valid",
             **data_proc_options,
         )
 
@@ -228,117 +252,163 @@ def main():
     y = data_train_dict["y"]
     polys = data_train_dict["polys"]
     logger.info(f"Number of samples: {len(y)}")
-
-    acc_res = []
-    kappa_res = []
-    f1_res = []
-    best_result = None
-
-    orig_ids = np.unique(y)
-
-    n_runs = args.runs
-    if args.validation is not None:
-        n_runs = 1
-        train_set = [data_train_dict["X"], data_train_dict["y"], None]
-        val_set = [data_val_dict["X"], data_val_dict["y"], None]
-        if args.hist_match:
-            val_set[0] = hist_match(val_set[0], X)
-
-    for run in range(1, n_runs + 1):
-        logger.info(f"Run {run}/{n_runs}")
-        if args.validation is None:
-            data_val_dict = data_train_dict
-            train_set, val_set, train_sum, val_sum = split_by_polygon_id(
-                X, y, polys, args.perc, return_sums=True, shuffle=True
-            )
-            split_ratios = train_sum / (train_sum + val_sum)
-            logger.info(
-                "Training split ratio per class: [%s]"
-                % (" ".join(["{0:0.2f}".format(val) for val in split_ratios]))
-            )
-
-        X_train = train_set[0]
-        X_ref = X_train.copy()
-        _, y_train = np.unique(train_set[1], return_inverse=True)
-        X_val = val_set[0]
-        _, y_val = np.unique(val_set[1], return_inverse=True)
-        poly_val = val_set[2]
-        if args.normalize != "none":
-            X_val = normalize_data(X_val, Xref=X_ref, normalization_type=args.normalize)
-            X_train = normalize_data(X_train, normalization_type=args.normalize)
-
-        model_options = dict()
-        if args.model == "nn":
-            model_options = {
-                "hidden_sizes": [512, 512],
-                "epochs": args.epochs,
-                "batch_size": args.batch,
-                "gpu": args.gpu,
+    with (mlflow.start_run() if args.track else nullcontext()):
+        if args.track:
+            param_dict = {
+                "Model": args.model,
+                "Normalization": args.normalize,
+                "Mode": args.mode,
+                "Split": args.perc,
+                "PEdim": args.embedding_dim,
+                "PESigma": args.embedding_sigma,
+                "Dilation radius": args.dilation_radius,
+                "BPI radius": args.bpi_radius,
             }
-        elif args.model == "rf":
-            model_options = {"n_estimators": 2, "random_state": 0}
+            if args.model == "nn":
+                param_dict.update({"Epochs": args.epochs, "Batch": args.batch})
+            mlflow.log_params(param_dict)
+            mlflow.set_tag("Inputs", args.inputs)
+            mlflow.set_tag("Validation", args.validation)
+            mlflow.set_tag("Taxonomy", args.taxonomy)
+            mlflow.set_tag("Runs", args.runs)
+            mlflow.set_tag("PE", args.embedding_dim > 0)
 
-        model = seabed_classifier_type[args.model](**model_options)
-        logger.info(f"Training {seabed_classifier_name[args.model]} model")
-        start = monotonic()
-        model.fit(X_train, y_train)
-        tdiff = monotonic() - start
-        logger.info(f"Time elapsed: {tdiff:.5f} seconds")
+        acc_res = []
+        kappa_res = []
+        f1_res = []
+        best_result = None
 
-        pred_labels = model.predict(X_val)
+        orig_ids = np.unique(y)
 
-        metrics = compute_metrics(y_val, pred_labels, polygons=poly_val)
+        n_runs = args.runs
+        if args.validation is not None:
+            n_runs = 1
+            train_set = [data_train_dict["X"], data_train_dict["y"], None]
+            val_set = [data_val_dict["X"], data_val_dict["y"], None]
+            if args.hist_match:
+                val_set[0] = hist_match(val_set[0], X)
 
-        logger.info(
-            f"Accuracy: {metrics['accuracy']:.3f}"
-            + f", kappa: {metrics['kappa']:.3f}"
-            + f", f1-score {metrics['f1-score']:.3f}"
-        )
-        if metrics["polygon"]:
+        for run in range(1, n_runs + 1):
+            logger.info(f"Run {run}/{n_runs}")
+            if args.validation is None:
+                data_val_dict = data_train_dict
+                train_set, val_set, train_sum, val_sum = split_by_polygon_id(
+                    X, y, polys, args.perc, return_sums=True, shuffle=True
+                )
+                split_ratios = train_sum / (train_sum + val_sum)
+                logger.info(
+                    "Training split ratio per class: [%s]"
+                    % (" ".join(["{0:0.2f}".format(val) for val in split_ratios]))
+                )
+
+            X_train = train_set[0]
+            X_ref = X_train.copy()
+            _, y_train = np.unique(train_set[1], return_inverse=True)
+            X_val = val_set[0]
+            _, y_val = np.unique(val_set[1], return_inverse=True)
+            poly_val = val_set[2]
+            if args.normalize != "none":
+                X_val = normalize_data(
+                    X_val,
+                    X_ref=X_ref,
+                    normalization_type=args.normalize,
+                )
+                X_train = normalize_data(X_train, normalization_type=args.normalize)
+
+            model_options = dict()
+            if args.model == "nn":
+                model_options = {
+                    "hidden_sizes": [args.nn_size, args.nn_size],
+                    "epochs": args.epochs,
+                    "batch_size": args.batch,
+                    "gpu": args.gpu,
+                }
+            elif args.model == "rf":
+                model_options = {"n_estimators": 2, "random_state": 0}
+
+            model = seabed_classifier_type[args.model](**model_options)
+            logger.info(f"Training {seabed_classifier_name[args.model]} model")
+            start = monotonic()
+            model.fit(X_train, y_train)
+            tdiff = monotonic() - start
+            logger.info(f"Time elapsed: {tdiff:.5f} seconds")
+
+            pred_labels = model.predict(X_val)
+
+            metrics = compute_metrics(y_val, pred_labels, polygons=poly_val)
+
+            # if args.track:
+            #     mlflow.log_metric("Accuracy", metrics["accuracy"], step=run)
+            #     mlflow.log_metric("Kappa", metrics["kappa"], step=run)
+            #     mlflow.log_metric("F1-score", metrics["f1-score"], step=run)
+
             logger.info(
-                f"Polygon accuracy: {np.sum(metrics['polygon'])}/{len(metrics['polygon'])}"
+                f"Accuracy: {metrics['accuracy']:.3f}"
+                + f", kappa: {metrics['kappa']:.3f}"
+                + f", f1-score {metrics['f1-score']:.3f}"
+            )
+            if metrics["polygon"]:
+                logger.info(
+                    f"Polygon accuracy: {np.sum(metrics['polygon'])}/{len(metrics['polygon'])}"
+                )
+
+            acc_res.append(metrics["accuracy"])
+            kappa_res.append(metrics["kappa"])
+            f1_res.append(metrics["f1-score"])
+
+            if (
+                best_result is None
+                or best_result["metrics"]["accuracy"] < metrics["accuracy"]
+            ):
+                best_result = {
+                    "model": deepcopy(model),
+                    "y": y_val,
+                    "predicted": pred_labels,
+                    "X_ref": X_ref,
+                    "metrics": metrics,
+                }
+
+        # Compute metric statistics
+        if len(acc_res) > 1:
+            acc_av = np.mean(acc_res)
+            acc_std = np.std(acc_res)
+            kappa_av = np.mean(kappa_res)
+            kappa_std = np.std(kappa_res)
+            f1_av = np.mean(f1_res)
+            f1_std = np.std(f1_res)
+            plusminus_symbol = chr(177)
+            logger.info(
+                f"Results after {n_runs} runs: AP {acc_av:.3f} {plusminus_symbol} {acc_std:.3f}"
+                + f", kappa {kappa_av:.3f} {plusminus_symbol} {kappa_std:.3f}"
+                + f", f1-score {f1_av:.3f} {plusminus_symbol} {f1_std:.3f}"
+            )
+        else:
+            acc_av = best_result["metrics"]["accuracy"]
+            kappa_av = best_result["metrics"]["kappa"]
+            f1_av = best_result["metrics"]["f1-score"]
+            acc_std, kappa_std, f1_std = (0, 0, 0)
+        if args.track:
+            mlflow.log_metrics(
+                {"Acc. Average": acc_av, "F1 Average": f1_av, "K Average": kappa_av}
+            )
+            mlflow.log_metrics(
+                {"Acc. Std": acc_std, "F1 Std": f1_std, "K Std": kappa_std}
             )
 
-        acc_res.append(metrics["accuracy"])
-        kappa_res.append(metrics["kappa"])
-        f1_res.append(metrics["f1-score"])
-
-        if best_result is None or best_result["accuracy"] < metrics["accuracy"]:
-            best_result = {
-                "model": deepcopy(model),
-                "y": y_val,
-                "predicted": pred_labels,
-                "X_ref": X_ref,
-                "accuracy": metrics["accuracy"],
-            }
-
-    # Compute metric statistics
-    if len(acc_res) > 1:
-        acc_av = np.mean(acc_res)
-        acc_std = np.std(acc_res)
-        kappa_av = np.mean(kappa_res)
-        kappa_std = np.std(kappa_res)
-        f1_av = np.mean(f1_res)
-        f1_std = np.std(f1_res)
-        plusminus_symbol = chr(177)
-        logger.info(
-            f"Results after {n_runs} runs: AP {acc_av:.3f} {plusminus_symbol} {acc_std:.3f}"
-            + f", kappa {kappa_av:.3f} {plusminus_symbol} {kappa_std:.3f}"
-            + f", f1-score {f1_av:.3f} {plusminus_symbol} {f1_std:.3f}"
+        # Compute confusion matrix
+        xls_path = None
+        if args.xls_file:
+            xls_path = pathlib.Path(args.output_dir) / (args.xls_file + ".xlsx")
+        cm = compute_cm(
+            best_result["y"],
+            best_result["predicted"],
+            round_prec=4,
+            cls_names=cls_name_maps[args.taxonomy][orig_ids],
+            xls_path=xls_path,
         )
-
-    # Compute confusion matrix
-    xls_path = None
-    if args.xls_file:
-        xls_path = pathlib.Path(args.output_dir) / (args.xls_file + ".xlsx")
-    cm = compute_cm(
-        best_result["y"],
-        best_result["predicted"],
-        round_prec=4,
-        cls_names=cls_name_maps[args.taxonomy][orig_ids],
-        xls_path=xls_path,
-    )
-    logger.info(f"Confusion Matrix:\n{cm}")
+        logger.info(f"Confusion Matrix:\n{cm}")
+        if args.track and args.xls_file:
+            mlflow.log_artifact(xls_path)
 
     if args.class_map:
         data = data_val_dict["data_all"]
@@ -351,7 +421,7 @@ def main():
             if args.normalize != "none":
                 data_all = normalize_data(
                     data[i],
-                    Xref=best_result["X_ref"],
+                    X_ref=best_result["X_ref"],
                     normalization_type=args.normalize,
                 )
             else:
@@ -362,7 +432,8 @@ def main():
                 raster[i],
                 raster_mask[i],
                 out_name,
-                args.plot,
+                id_map=orig_ids,
+                plot=args.plot,
             )
 
 

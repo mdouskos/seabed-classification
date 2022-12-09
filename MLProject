@@ -1,0 +1,16 @@
+name: Seabed Classification
+
+conda_env: seabed_env.yaml
+
+entry_points:
+  main:
+    parameters:
+      region: string
+      model: {type: string, default: "rf"} 
+      mode: {type: string, default: "bs"}
+      split: {type: float, default: 0.7}
+      pe_dim: {type: float, default: 0}
+      pe_sigma: {type: float, default: 5e-5}
+      dil_radius: {type: float, default: 16}
+      nn_size: {type: float, default: 512}
+    command: "python seabed_classification.py --dataset-dir ./Datasets/paper/aligned --track --runs 3 --perc {split} --inputs {region} --mode {mode} --model {model} --embedding-dim {pe_dim} --embedding-sigma {pe_sigma} --dilation-radius {dil_radius} --epochs 6 --batch 256000 --gpu --nn-size {nn_size}"

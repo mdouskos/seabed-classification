@@ -68,7 +68,11 @@ def compute_cm(y_gt, y_pred, labels=None, round_prec=2, cls_names=None, xls_path
     df.index = first_col
 
     if xls_path:
-        writer = pd.ExcelWriter(xls_path)
+        writer = pd.ExcelWriter(
+            xls_path,
+            engine="xlsxwriter",
+            engine_kwargs={"options": {"strings_to_numbers": True}},
+        )
         df.to_excel(writer, "CM")
         writer.save()
 

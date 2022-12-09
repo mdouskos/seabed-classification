@@ -2,18 +2,20 @@ import numpy as np
 import math
 
 
-def normalize_data(X, Xref=None, normalization_type="std"):
-    if Xref is None:
-        Xref = X
+def normalize_data(X, X_ref=None, normalization_type="std"):
+    if X_ref is None:
+        X_ref = X
     if normalization_type == "std":
-        Xnorm = (X - np.mean(Xref, axis=0)) / np.std(Xref, axis=0)
+        X_norm = (X - np.mean(X_ref, axis=0)) / np.std(X_ref, axis=0)
     elif normalization_type == "minmax":
-        Xnorm = (X - np.min(Xref, axis=0)) / (
-            np.max(Xref, axis=0) - np.min(Xref, axis=0)
+        X_norm = (X - np.min(X_ref, axis=0)) / (
+            np.max(X_ref, axis=0) - np.min(X_ref, axis=0)
         )
+    elif normalization_type == "range":
+        X_norm = X / 255
     else:
         raise ValueError(f"Unrecognlized normalization type {normalization_type}")
-    return Xnorm
+    return X_norm
 
 
 def hist_match(source, template):
