@@ -31,7 +31,8 @@ class SurveyData:
         mode: str = "bs",
         X_field: str = "X",
         Y_field: str = "Y",
-        taxonomy: Literal["folk 5", "folk 7"] = "folk 7"
+        taxonomy: Literal["folk 5", "folk 7"] = "folk 7",
+        samples_key: str = "samples",
     ):
         if type(data_description) == str:
             data_description = Path(data_description)
@@ -50,6 +51,7 @@ class SurveyData:
         self.dataset_dir = dataset_dir
         self.data_description = data_description
         self.mode = mode
+        self.samples_key = samples_key
         self.__read_all_data()
 
     def plot(self):
@@ -174,9 +176,7 @@ class SurveyData:
         assert Path(raster_file).suffix == ".tif"
         logger.info("Reading " + raster_file + "...")
         raster_file = (
-            self.dataset_dir
-            / Path(self.data_description["directory"])
-            / raster_file
+            self.dataset_dir / Path(self.data_description["directory"]) / raster_file
         )
         raster = rioxarray.open_rasterio(raster_file)
         if n_bands == 1:
@@ -191,10 +191,8 @@ class SurveyData:
         self.__setattr__(key, raster)
         self.__setattr__(key + "_mask", mask)
 
-    def __read_samples(
-        self,
-        key: str = "samples",
-    ):
+    def __read_samples(self):
+        key = self.samples_key
         assert hasattr(self, "backscatter")
         samples_file = self.data_description[key]
         assert Path(samples_file).suffix in (".csv", ".txt")
